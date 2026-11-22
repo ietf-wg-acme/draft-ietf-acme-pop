@@ -1,0 +1,1369 @@
+---
+title: "Automated Certificate Management Environment (ACME) Extension for Proof-of-Possession"
+abbrev: "ACME PoP Challenge"
+category: std
+submissionType: IETF
+docname: draft-ietf-acme-pop-latest
+ipr: trust200902
+updates: RFC 8555
+area: "Security"
+workgroup: "Automated Certificate Management Environment"
+keyword:
+ - acme
+ - proof of possession
+ - public key
+ - certificate issuance
+venue:
+  group: "Automated Certificate Management Environment"
+  type: "Working Group"
+  mail: "acme@ietf.org"
+  arch: "https://mailarchive.ietf.org/arch/browse/acme/"
+  github: "ietf-wg-acme/draft-ietf-acme-pop"
+
+author:
+  -
+   name: "Feng Geng"
+   org: "Yinwang Intelligent Technology"
+   email:
+     - "gengfeng@yinwang.com"
+     - "507069@qq.com"
+  -
+   name: "Panyu Wu"
+   org: "Huawei Technologies"
+   email: "wupanyu3@huawei.com"
+  -
+   name: "Liang Xia"
+   org: "Huawei Technologies"
+   email: "frank.xialiang@huawei.com"
+  -
+   name: "Xin Chen"
+   org: TrustAsia
+   email: "palos.chen@trustasia.com"
+
+
+normative:
+  FIPS-203:
+    target: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf
+    title: "Module-Lattice-Based Key-Encapsulation Mechanism Standard"
+    date: 2024-08-13
+    author:
+      org: National Institute of Standards and Technology (NIST)
+    seriesinfo:
+      FIPS: "203"
+  FIPS-204:
+    target: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.204.pdf
+    title: "Module-Lattice-Based Digital Signature Standard"
+    date: 2024-08-13
+    author:
+      org: National Institute of Standards and Technology (NIST)
+    seriesinfo:
+      FIPS: "204"
+  FIPS-205:
+    target: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.205.pdf
+    title: "Stateless Hash-Based Digital Signature Standard"
+    date: 2024-08-13
+    author:
+      org: National Institute of Standards and Technology (NIST)
+    seriesinfo:
+      FIPS: "205"
+  X.690:
+    target: https://www.itu.int/rec/T-REC-X.690
+    title: "Information technology - ASN.1 encoding rules: Specification of Basic Encoding Rules (BER), Canonical Encoding Rules (CER) and Distinguished Encoding Rules (DER)"
+    date: 2021-02-13
+    author:
+      org: ITU-T
+    seriesinfo:
+      ITU-T: "X.690"
+  P1363:
+    target: https://doi.org/10.1109/IEEESTD.2000.92292
+    title: "IEEE Standard Specifications for Public-Key Cryptography"
+    date: 2000
+    author:
+      org: IEEE
+    seriesinfo:
+      IEEE: "Std 1363-2000"
+      DOI: "10.1109/IEEESTD.2000.92292"
+
+
+
+
+informative:
+  I-D.ietf-acme-profiles:
+  I-D.ietf-cose-cbor-encoded-cert:
+  I-D.ietf-acme-device-attest:
+  I-D.ietf-acme-rats:
+  I-D.ietf-lamps-pq-composite-kem:
+
+
+--- abstract
+
+The Automated Certificate Management Environment (ACME) protocol {{!RFC8555}} requires a PKCS#10 Certificate Signing Request (CSR) at the finalization stage. This document defines an optional extension that allows a client to prove possession of a private key directly, without constructing a CSR. The extension is motivated by use cases where the CSR-based flow is problematic: KEM-only keys that cannot generate self-signatures, resource-constrained devices that benefit from reduced encoding overhead, and issuance models where the certificate is constructed from order and profile data (e.g., via the ACME Profiles extension {{I-D.ietf-acme-profiles}}) rather than a client-generated CSR. This is particularly relevant when combined with compact encodings such as C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}}.
+
+In the "newOrder" request, the client declares the public key via a `popKey` field and includes a `pop` identifier whose value is the empty string. The server creates a dedicated `pop` authorization containing a single `pop-01` challenge, processed using the same state machine as any other ACME authorization. When all authorizations (including the `pop` authorization) are valid, the ACME server issues a certificate using the validated public key and the authorized identifiers, eliminating the need for a CSR at finalization. The extension is additive and strictly optional: clients that do not use it, and servers that do not support it, continue to use the standard CSR-based flow defined in {{!RFC8555}} without any changes.
+
+--- middle
+
+# Introduction {#introduction}
+
+## Background and Motivation {#background-and-motivation}
+
+In the current ACME flow {{!RFC8555}}, the applicant submits a PKCS#10 {{?RFC2986}} CSR at the finalization stage. The CSR carries both the certificate public key and a self-signature over the CSR contents. For a signature-capable key, verification of that self-signature demonstrates possession of the corresponding private key. A KEM-only key cannot create such a signature.
+
+**The core principle underlying this extension is that the order is the authoritative source of the client-declared certificate parameters.** All information that the client contributes to the certificate, identifiers and public key alike, is declared in the order. The remaining certificate fields (subject, validity period, key usage, etc.) are determined by CA policy and any applicable certificate profile; optional extensions such as {{I-D.ietf-acme-profiles}} enable the client to select a profile that governs these fields.
+
+This principle is embodied as an **optional** extension to ACME. The existing CSR-based flow remains fully supported and unchanged; clients and servers that do not need CSR-less issuance simply ignore the extension. The extension is optional on purpose: protocol evolution should be additive, not disruptive.
+
+The principle addresses several distinct challenges in current ACME deployments:
+
+- **KEM-only keys.**  Key-encapsulation mechanisms (such as ML-KEM {{FIPS-203}}) cannot produce digital signatures, making CSR self-signatures impossible. The `pop-01` challenge provides a direct ACME proof for such keys without assuming signature capability.
+- **Resource-constrained devices.**  Constructing a valid PKCS#10 CSR requires additional ASN.1 structures and signing logic. Avoiding this work can reduce code complexity for constrained clients, while still carrying the certificate public key as a DER-encoded SubjectPublicKeyInfo.
+- **Compact certificate encodings.**  C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}} provide a compact CBOR encoding for constrained environments. The CSR-less flow complements C509 by removing the client-side ASN.1/DER encoding step from the certificate request process. This is particularly relevant for C509 certificate type 2 (native CBOR-signed certificates), where the C509 certification request does not include a self-signature mechanism for proof of possession; the `pop` authorization supplies the necessary proof.
+
+This extension is an additive complement to the CSR-based flow, not a replacement; deployments that rely on CSR for integration with HSMs, enterprise CA workflows, or legacy clients continue to operate unchanged. The `pop-01` challenge exists because the order-centric principle offers a cleaner architecture for emerging use cases and because post-quantum cryptography introduces key types incompatible with the CSR self-signature mechanism. This does not imply that CSR or PKCS#10 is flawed; both remain in widespread use.
+
+## Scope {#scope}
+
+This document defines:
+
+- A new field `popKey` in the "newOrder" request, through which the client declares the public key to be certified.
+
+- A new **`pop` identifier type** in the ACME Identifier Types registry, whose value is the empty string, used to request a dedicated proof-of-possession authorization.
+
+- A new **`pop-01` challenge type** that is placed exclusively in the `pop` authorization. The challenge contains either a `popNonce` (for signature keys) or a `challenge_ciphertext` (for KEM keys).
+
+- Two proof-of-possession modes within the `pop-01` challenge: one for signature keys and the other for KEM keys.
+
+- A finalization stage that accepts an empty JSON object when **all authorizations** (including the `pop` authorization) are valid.
+
+The `pop` authorization is the sole container for the proof-of-possession challenge. The `pop` identifier is a protocol-level marker, not a certificate identifier; it is not encoded in the issued certificate. Its empty value carries neither the public key nor a hash of that key. Its sole purpose is to trigger the creation of a dedicated `pop` authorization.
+
+This document does not define proof constructions for DH-based KEMs (DHKEM), including those derived from ECDH; such constructions require a separate extension.
+
+Identifier-control validation (for DNS names, email addresses, etc.) continues to be performed by existing ACME challenge types (dns-01, http-01, tls-alpn-01, email-reply-00, etc.); the `pop-01` challenge solely proves private key possession. **This extension does not modify, overload, or replace any existing challenge type.**
+
+This document does not define integration details for specific certificate encodings such as C509, nor a complete C509 automation solution; C509 appears here as an illustrative use case of the CSR-less flow. Complementary mechanisms for device identity and authorization, such as `device-attest-01` {{I-D.ietf-acme-device-attest}} or other identifier validation methods, may be needed depending on the deployment scenario.
+
+This document defines the `popKey` field as a DER-encoded SubjectPublicKeyInfo {{!RFC5280}}. The mapping of this public key representation to non-DER certificate encodings (such as C509 {{I-D.ietf-cose-cbor-encoded-cert}}) is defined by the respective certificate encoding specifications, not by this document.
+
+
+## Relationship to Other ACME Extensions {#relationship-to-other-acme-extensions}
+
+This extension is part of a broader evolution of the ACME protocol toward a model where **the order is the authoritative source of client-declared certificate parameters.** Several ongoing and completed ACME working group efforts share and complement this design principle:
+
+- **Certificate Profiles (draft-ietf-acme-profiles).** Profiles lets a client specify a certificate profile in `newOrder`, so the server constructs the certificate from a predefined profile rather than from the client CSR. The `pop` authorization composes with Profiles: an order may carry both a `profile` and a `pop` identifier, with the CA using the validated `popKey` as the certificate public key under the requested profile.
+- **Device Attestation (draft-ietf-acme-device-attest).** Device attestation establishes a device's identity and trusted state; the `pop` authorization proves possession of the certificate key. When CA policy requires both, they are separate authorizations, and both must be `valid` before the order becomes `ready`.
+- **Remote Attestation (draft-ietf-acme-rats).** The RATS work provides precedent for an auxiliary identifier type that does not appear in the issued certificate but requests a dedicated authorization. This document follows that pattern with stricter rules for `pop`: exactly one such identifier, an empty value, and mandatory pairing with `popKey`. Section 3.5 specifies the composition rules for `pop` with RATS identifiers.
+- **Short-Term, Automatically Renewed (STAR) Certificates ({{!RFC8739}}).** STAR issues short-lived certificates that the CA renews automatically, reissuing from the bootstrap CSR without new CSRs for subsequent renewals. The `pop` authorization extends this by also removing the bootstrap CSR, enabling a fully CSR-less flow for both initial issuance and STAR renewals.
+- **Renewal Information (ARI, {{?RFC9773}}).** ARI lets the server suggest renewal timing, shifting scheduling from client-side heuristics to server-side policy. This complements the `pop` authorization's goal of making the order the authoritative source of client-declared certificate parameters by also making the CA the authoritative source of renewal policy.
+
+This extension is designed to be used orthogonally with all of the above. The `pop` authorization provides a unified proof-of-possession mechanism that can be combined with Profiles (for certificate content), Device Attestation or RATS (for device trust), and STAR or ARI (for lifecycle management), without requiring changes to any of those extensions.
+
+When combined with C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}}, the `pop` authorization and device attestation {{I-D.ietf-acme-device-attest}} form a complementary IoT certificate automation stack: device attestation establishes identity and trusted state, the `pop` authorization proves possession of the certificate private key, and C509 provides compact CBOR encoding for constrained delivery. This combination is illustrative, not exhaustive; deployments may use other identifier validation mechanisms as appropriate. Section 10.3 provides a complete example of this three-layer stack.
+
+The normative composition rules for combining the `pop` authorization with these extensions are specified in Section 3.5.
+
+
+## Protocol Overview {#protocol-overview}
+
+The following diagram provides a high-level overview of the `pop-01` protocol interaction:
+
+~~~
+CLIENT                                      SERVER
+   |                                          |
+   |--- (0) GET /directory ------------------>|
+   |<-- meta.popSupported = true -------------|
+   |                                          |
+   |--- (1) POST /newOrder ------------------>|
+   |    identifiers = [dns, pop] + popKey     |
+   |                                          | accept and record popKey
+   |                                          | (see Section 3.2 for full
+   |                                          |  validation details)
+   |                                          | create DNS authorization
+   |                                          | create pop authorization
+   |                                          |   (with pop-01)
+   |<-- (2) order: pending -------------------|
+   |    identifiers = [dns, pop]              |
+   |    authorizations = [dns, pop]           |
+   |                                          |
+   |--- POST-as-GET /authz/dns -------------->|
+   |<-- dns-01 challenge ---------------------|
+   |--- POST-as-GET /authz/pop -------------->|
+   |<-- pop-01 challenge ---------------------|
+   |                                          |
+   |--- (3a) complete dns-01 ---------------->|
+   |<-- updated dns-01 challenge -------------|
+   |--- (3b) POST pop-01 challenge URL ------>|
+   |    decoded payload = {"proof":"..."}     |
+   |                                          | transition to processing
+   |                                          | perform cryptographic validation
+   |<-- (3b) updated pop-01 challenge --------|
+   |    (status: processing -> valid/invalid) |
+   |                                          |
+   |--- (3c) POST-as-GET order URL ---------->|
+   |<-- order: ready -------------------------|
+   |--- (4) finalize; empty object ---------->|
+   |<-- (5) order: processing or valid -------|
+   |--- (6) POST-as-GET order URL ----------->|
+   |<-- order: valid; certificate URL --------|
+   |--- (7) POST-as-GET certificate URL ----->|
+   |<-- certificate chain --------------------|
+~~~
+{: #fig-pk-1 title="High-level overview of the pop-01 protocol interaction"}
+
+After submitting a challenge response, clients MUST poll the challenge URL until it reaches a terminal state (`valid` or `invalid`), observing `processing` if the server validates asynchronously; the server MAY validate synchronously, in which case `processing` may be transient and not observable by the client. POST-as-GET requests are account-key-authenticated JWS POSTs with an empty payload, as specified in {{!RFC8555}}, Section 6.3.
+
+## Design Philosophy: The `pop` Authorization {#design-philosophy-the-pop-authorization}
+
+As stated in Section 1.1, the core principle is that the order is the authoritative source of client-declared certificate parameters. The `pop` authorization implements this principle by introducing a dedicated authorization for proof-of-possession, independent of identifier validation.
+
+The design introduces `pop` as a new identifier type that requests a dedicated authorization, rather than attaching a challenge to existing certificate-identifier authorizations. The reasons, and the alternatives considered, are analyzed in Appendix A. The main points:
+
+- **PoP is an independent verification.** Proving possession of a private key is logically independent of proving control over an identifier. The `pop` authorization treats PoP as a verification object in its own right.
+- **Orders combine authorizations with AND-semantics.** An ACME order already requires all listed authorizations to be valid; the `pop` authorization is one more item in that list, with no special-case logic.
+- **The `pop` authorization is order-specific.** It is not reused across orders (Section 4.3), maintaining the order-specific binding of the proof.
+
+By completing the PoP proof before the order becomes `ready`, the design removes the CSR as a separate, late-binding parameter channel and makes the order the complete specification of the client-declared certificate parameters at `ready` time; the security analysis is in Section 7.1.
+
+## Updates to {{!RFC8555}} {#updates-to}
+
+This document updates {{!RFC8555}} in the following respects:
+
+1. **Finalize Payload (Section 6.1):** {{!RFC8555}}, Section 7.4 requires the finalize request payload to contain a `csr` field. This document allows an empty JSON object (`{}`) as the finalize payload when the order contains an accepted `popKey` and `pop` identifier pair, enabling CSR-less certificate issuance.
+
+2. **Authorization Reuse (Section 4.3):** {{!RFC8555}}, Section 7.1.3 describes cases where authorizations may be reused across orders. This document defines a new `pop` authorization type that MUST NOT be reused across orders, maintaining the order-specific binding of the proof-of-possession.
+
+3. **Identifier Semantics (Sections 3.1, 4.1):** {{!RFC8555}}, Section 7.1.3 assumes that all identifiers in the order's `identifiers` array are certificate identifiers. This document introduces the `pop` identifier type, which is a protocol-level marker rather than a certificate identifier. It does not represent a resource to be bound to the issued certificate and is not encoded in the certificate.
+
+These updates are designed as optional extensions to ACME. The existing CSR-based flow remains fully supported for clients that do not use this extension; the normative changes only apply to orders that explicitly request the CSR-less flow by including a `popKey` and `pop` identifier pair.
+
+# Conventions and Definitions {#conventions-and-definitions}
+
+The key words "**MUST**", "**MUST NOT**", "**REQUIRED**", "**SHALL**", "**SHALL NOT**", "**SHOULD**", "**SHOULD NOT**", "**RECOMMENDED**", "**NOT RECOMMENDED**", "**MAY**", and "**OPTIONAL**" in this document are to be interpreted as described in BCP 14 {{!RFC2119}} {{!RFC8174}} when, and only when, they appear in all capitals, as shown here.
+
+This document uses the following terminology:
+
+- **ACME Client:** An ACME client as defined in {{!RFC8555}}. In this document, "client" and "applicant" (the entity holding the private key to be certified) refer to the same entity.
+
+- **ACME Server:** An ACME server as defined in {{!RFC8555}}, operated by a Certification Authority (CA) or its delegated service.
+
+- **`popKey`:** A field in the "newOrder" request through which the client declares the public key requested for the certificate. Its value is the Base64URL encoding (without padding) of the DER-encoded SubjectPublicKeyInfo (SPKI) defined in {{!RFC5280}}, Section 4.1.2.7. Section 3.2 defines server validation and error handling.
+
+- **`popSupported`:** A field in the Directory metadata indicating that the server supports the `pop` identifier type, the `pop-01` challenge, and the `popKey` field.
+
+- **`pop` identifier:** A protocol-level marker included in the `identifiers` array to request a dedicated proof-of-possession authorization. It is syntactically represented as an identifier type with an empty value, but it is not a certificate identifier. It does not represent a resource to be bound to the issued certificate and MUST NOT appear in the certificate's `subject` or `subjectAltName` extension. Its sole purpose is to trigger the creation of a dedicated `pop` authorization.
+
+- **`pop` authorization:** An ACME Authorization object whose identifier type is `pop` and whose value is the empty string. This authorization corresponds to the `pop` identifier in the order's `identifiers` array, maintaining the one-to-one mapping required by {{!RFC8555}}, Section 7.1.3. Its URL appears in the order's `authorizations` array at the same position as the `pop` identifier.
+
+- **`pop-01` challenge:** A challenge type defined in this document. It proves possession of the private key corresponding to the public key declared in the order's `popKey` field. The challenge object contains either a `popNonce` (for signature keys) or a `challenge_ciphertext` (for KEM keys).
+
+- **Certificate Identifier:** An ACME identifier whose defining specification and the applicable certificate profile determine its representation or binding in the issued certificate. The auxiliary `pop` identifier is not a certificate identifier.
+
+- **PoP Key:** The public key whose possession is being proved, encoded in the `key` field of the `pop-01` challenge object. Its value is byte-identical to the `popKey` provided in the "newOrder" request.
+
+- **Signature key:** An asymmetric key capable of digital signature operations (e.g., ECDSA, Ed25519, RSASSA-PSS, ML-DSA, SLH-DSA).
+
+- **KEM key:** An asymmetric key capable of Key Encapsulation Mechanism operations (e.g., ML-KEM). This document defines the construction for the KEM algorithms specified here; a DHKEM or ECDH construction is outside its scope.
+
+- **Proof of Possession (PoP):** A cryptographic mechanism by which the requester proves possession of the private key corresponding to a declared public key. For signature keys, the PoP is a signature over challenge material; for KEM keys, it is a MAC derived from a shared secret obtained through KEM decapsulation.
+
+- **raw_newOrder:** The exact octet sequence obtained by Base64URL-decoding the JWS `payload` member of the "newOrder" request, before JSON parsing.
+
+- **newOrder_hash:** SHA-256 {{!RFC6234}} (raw_newOrder).
+
+- **Base64URL encoding:** All Base64URL encodings in this document use the unpadded form (base64url-without-padding, per {{!RFC7515}}, Section 2), consistent with ACME {{!RFC8555}} and the JOSE ecosystem. Padding and whitespace are not part of this encoding.
+
+
+# Declaring the Public Key: the `popKey` Field {#declaring-the-public-key-the-popkey-field}
+
+## The `popKey` Field in `newOrder` {#the-popkey-field-in-neworder}
+
+
+The `popKey`/`pop-01` flow enables certificate requests for key types that cannot produce CSR self-signatures, such as KEM keys. Clients using signature-capable keys and able to construct CSRs can instead use the standard flow described in {{!RFC8555}}. Before creating an order, a client can use the `popSupported` field in the Directory metadata (Section 3.4) to discover whether the server supports this flow.
+
+A client that wishes to use the CSR-less flow declares the public key to be certified by including a `popKey` field and exactly one `pop` identifier in the decoded JWS payload of the "newOrder" request:
+
+~~~
+{
+  "identifiers": [
+    { "type": "dns", "value": "example.com" },
+    { "type": "pop", "value": "" }
+  ],
+  "popKey": "<base64url(DER-encoded SPKI)>"
+}
+~~~
+
+As required by {{!RFC8555}}, the client sends these payload octets in an account-key-authenticated JWS with media type `application/jose+json`.
+
+Field description:
+
+- **popKey** (OPTIONAL): The Base64URL encoding (without padding) of the DER-encoded SubjectPublicKeyInfo (SPKI) defined in {{!RFC5280}}, Section 4.1.2.7 for the public key to be certified.
+
+The `popKey` field and the `pop` identifier are paired. A client MUST include exactly one `popKey` member and exactly one `pop` identifier, or omit both. When present, the `pop` identifier's `value` MUST be the empty string, and the `identifiers` array MUST also contain at least one certificate identifier. A client MUST NOT use `pop` in a `newAuthz` request. This document does not define issuance for an order whose only identifier is `pop`.
+
+The `popKey` field is not itself an identifier; it declares the public key requested for the certificate. The `pop` identifier requests a separate proof-of-possession authorization but carries no public key, SPKI hash, or other lookup value. The public key is conveyed only by `popKey` and echoed by the challenge's `key` field.
+
+## Server Processing of `popKey` {#server-processing-of-popkey}
+
+If neither `popKey` nor a `pop` identifier is present, the server processes the request according to {{!RFC8555}} and other applicable extensions. A server implementing this specification MUST reject the request with `urn:ietf:params:acme:error:malformed` if it contains only one member of the pair, more than one `popKey` member, more than one `pop` identifier, a `pop` identifier whose value is not the empty string, or no certificate identifier. It MUST reject `pop` in a `newAuthz` request with `urn:ietf:params:acme:error:malformed`, because this identifier type is supported only as part of an order and cannot be pre-authorized.
+
+Upon receiving a "newOrder" request with a valid `popKey` and a `pop` identifier in the `identifiers` array, a server that accepts the request:
+
+1. MUST validate that the `popKey` value decodes to a well-formed SPKI encoded using the Distinguished Encoding Rules (DER) specified in {{X.690}}, and that it contains no non-Base64URL characters or whitespace.
+2. MUST verify that the AlgorithmIdentifier, algorithm-specific public key encoding and length, and key parameters are supported for proof-of-possession and satisfy CA policy. For an ML-KEM `popKey`, the server MUST apply the encapsulation-key type check and the modulus check specified in {{FIPS-203}}, Section 7.2 (ML-KEM.Encaps), to the raw `subjectPublicKey` octets. If either ML-KEM check fails, the server MUST NOT invoke ML-KEM.Encaps and MUST reject the "newOrder" request with `urn:ietf:params:acme:error:badPopKey` without committing any order, authorization, or challenge state.
+3. MUST verify that the public key in `popKey` differs from the account public key of the ACME account placing the order. If the keys are identical, the server MUST reject the request with `urn:ietf:params:acme:error:badPopKey`. Equality is determined by byte-for-byte comparison of canonical DER-encoded SubjectPublicKeyInfo. The server MUST first convert the account public key to its canonical DER SPKI form per {{!RFC5280}} and {{!RFC5480}}, then compare the resulting octets with the decoded `popKey` octets. Canonicalization ensures that different valid encodings of the same cryptographic key are treated as equal. The account key authenticates ACME protocol messages; using it also as the certificate key would conflate two distinct security domains.
+4. MUST reject the "newOrder" request with `urn:ietf:params:acme:error:badPopKey` if any syntax, algorithm, parameter, or account-key validation fails. The problem detail SHOULD identify the incompatibility without exposing sensitive server policy.
+5. MAY reject an otherwise valid request with `urn:ietf:params:acme:error:popKeyRejectedByPolicy` when the account or request is not authorized for CSR-less issuance.
+6. MUST atomically store the accepted `popKey` value and `newOrder_hash` as order data. When the order contains an auto-renewal object, the stored popKey MUST be retained for the duration of the STAR order's active lifetime and MUST be used for all automatic renewals under that order.
+7. MUST retain the client-supplied `pop` identifier in the order's immutable `identifiers` array.
+8. MUST create exactly one `pop` authorization for the `pop` identifier. The server MUST maintain the one-to-one correspondence between the order's `identifiers` array and its `authorizations` array, as defined in {{!RFC8555}}, Section 7.1.3. The `pop` authorization corresponds to the `pop` identifier in the `identifiers` array, and its URL MUST appear in the `authorizations` array at the same position as the `pop` identifier in the `identifiers` array.
+9. MUST place that authorization's URL in the initial order object's immutable `authorizations` array.
+10. MUST create exactly one `pop-01` challenge in that `pop` authorization.
+11. MUST set the challenge's `key` field to exactly equal the accepted `popKey` string.
+12. MUST NOT attach a `pop-01` challenge to any identifier authorization (dns, email, etc.).
+
+The server MAY enforce a maximum length for `popKey` values consistent with its supported algorithm set. Requests exceeding this limit MUST be rejected with `badPopKey`.
+
+The server MUST verify that the JSON-parsed order is semantically consistent with the `raw_newOrder` octets. If the decoded payload contains duplicate JSON keys, or if JSON parsing would produce a result that is not uniquely determined by the raw octets, the server MUST reject the request with `malformed`. The `raw_newOrder` octets are always authoritative for proof binding purposes.
+
+For an ML-KEM `popKey`, the atomic operation in steps 6-11 is committed only after the Section 5.2 challenge-creation procedure, including ML-KEM.Encaps, completes successfully. A server-side execution error after successful input validation produces `urn:ietf:params:acme:error:serverInternal` and leaves no partially created order, authorization, challenge, or proof state.
+
+
+## Order Object with `popKey` {#order-object-with-popkey}
+
+After atomically accepting the request and creating the `pop` authorization, the server MUST include the accepted `popKey` value and retain the requested `pop` identifier in the initial order object:
+
+~~~
+{
+  "status": "pending",
+  "expires": "2026-09-30T00:00:00Z",
+  "identifiers": [
+    { "type": "dns", "value": "example.com" },
+    { "type": "pop", "value": "" }
+  ],
+  "authorizations": [
+    "https://acme.example.com/acme/authz/dns-abc123",
+    "https://acme.example.com/acme/authz/pop-def456"
+  ],
+  "popKey": "<base64url(DER-encoded SPKI)>",
+  "finalize": "https://acme.example.com/acme/order/xyz/finalize"
+}
+~~~
+
+The `authorizations` array maintains the same order as the `identifiers` array. The URL at the position corresponding to the `pop` identifier resolves to the `pop` authorization, which contains the sole `pop-01` challenge. This ordering is consistent with {{!RFC8555}}, Section 7.1.3.
+
+The echoed `popKey` JSON string MUST be exactly equal to the value in the "newOrder" request. The order's `identifiers` array MUST contain the requested `{ "type": "pop", "value": "" }` object, and the `authorizations` array MUST contain exactly one authorization whose identifier is that object and whose sole challenge is `pop-01`. These conditions confirm that the server accepted the paired request; they do not guarantee that validation or issuance will succeed.
+
+If a server returns an order that omits or changes `popKey` or `pop`, or that does not provide exactly one corresponding authorization, the client MUST treat the CSR-less request as unaccepted and abandon that order; see Section 9.2.1 for the complete fallback behavior. The client MUST NOT attempt CSR finalization on the inconsistent order.
+
+## Server Capability Advertisement {#server-capability-advertisement}
+
+An ACME server can advertise support for this extension in its Directory metadata:
+
+~~~
+{
+  "newNonce": "https://acme.example.com/acme/new-nonce",
+  "newAccount": "https://acme.example.com/acme/new-acct",
+  "newOrder": "https://acme.example.com/acme/new-order",
+  "meta": {
+    "popSupported": true
+  }
+}
+~~~
+
+The `popSupported` field, located inside the "meta" object, is a boolean. A value of true indicates support for the `pop` identifier type, the `pop-01` challenge type, the `popKey` field, and the CSR-less finalization flow. Absence or a false value indicates that the client cannot rely on CSR-less operation at that server. A successful order response confirms acceptance by retaining the requested `pop` identifier, echoing the accepted `popKey`, and including the corresponding authorization.
+
+A server that supports the combination of `pop` authorization with STAR certificates SHOULD advertise this capability by including a `popStarSupported` field in the `meta` object:
+
+~~~
+"meta": {
+  "popSupported": true,
+  "popStarSupported": true
+}
+~~~
+
+The `popStarSupported` field, when present and true, indicates that the server accepts `pop` identifiers in STAR orders and will use the validated `popKey` for automatic renewals.
+
+
+### Discovery for STAR Composition {#discovery-for-star-composition}
+
+When a client wishes to request a STAR order {{!RFC8739}} using the CSR-less flow, it SHOULD proceed as follows:
+
+1. Check that the server advertises `popSupported: true` (Section 3.4) and `auto-renewal` support ({{!RFC8739}}, Section 3.2).
+2. Check that the server advertises `popStarSupported: true` (Section 3.4). If absent or false, the client MUST NOT include a `pop` identifier in STAR orders.
+3. If all three are advertised, the client MAY create a STAR order using the CSR-less flow.
+
+A server that does not support the STAR combination MUST reject a STAR order containing a `popKey` and a `pop` identifier with `urn:ietf:params:acme:error:malformed`. A server that supports the STAR combination but rejects the request for a different reason MUST return the error type defined for that reason. For example, it MUST return `badPopKey` when the key is invalid or unsupported, and `popKeyRejectedByPolicy` when the key is acceptable but its use is prohibited by CA policy.
+
+## Composition with Other ACME Extensions {#composition-with-other-acme-extensions}
+
+The following rules apply when a CSR-less order also carries another ACME extension or certificate encoding. Unless stated otherwise, the `pop` authorization composes with the extension orthogonally.
+
+- **With Certificate Profiles:** The `popKey` field and the `profile` field MAY be used together in the same `newOrder` request. The CA MUST use the validated `popKey` as the certificate public key and apply the requested profile to construct the remainder of the certificate.
+- **With STAR Certificates:** The `popKey` field and the `auto-renewal` object {{!RFC8739}}, Section 3.1.1 MAY be used together in the same `newOrder` request. When present together:
+  - Whether a server supports the STAR combination is established via the capability discovery procedure in Section 3.4.1. When combined, the `popKey` recorded in the order at bootstrap time serves as the persistent public key for all automatic renewals within the STAR order's lifetime, in the same way that the CSR serves this role in {{!RFC8739}}, Section 2.2; the retention and renewal-use obligations are specified in Section 3.2, step 6. The client MUST NOT change the `popKey` during the order's auto-renewal lifetime; a change of public key requires a new order with a fresh `pop` authorization. Automatic renewal therefore does not re-run the `pop-01` challenge; the initial PoP validation is reused for the order's lifetime, consistent with {{!RFC8739}}'s reuse of the initial CSR.
+  - Once it becomes `valid`, the `pop` authorization authorizes use of the accepted `popKey` only for automatic renewals under this STAR order. The authorization MUST NOT be used after its `expires` time or the order's `auto-renewal.end-date`, whichever occurs first, and MUST NOT be used to issue a certificate with a `notAfter` later than the `end-date`. Reaching the `end-date` ends automatic issuance but does not change the STAR order resource's status from `valid`. Upon successful cancellation of the STAR order, the server MUST NOT issue any additional certificates for that order. Cross-order reuse of a `pop` authorization remains prohibited (Section 4.3).
+  - The CA MUST NOT require a new `pop-01` challenge or any other proof-of-possession for individual auto-renewals within the same STAR order.
+  - The client MAY terminate the auto-renewal sequence at any time via the cancellation interface defined in {{!RFC8739}}, Section 3.1.2. Upon successful cancellation, the server MUST NOT issue any additional certificates for this Order.
+  - All other {{!RFC8739}} constraints on STAR orders, including the prohibition on `notBefore` and `notAfter` in the order ({{!RFC8739}}, Section 3.1.1), apply unchanged when combined with `pop`.
+- **With Device Attestation:** The `pop` authorization and the device-attestation authorization are independent and may be completed in any order. Both MUST reach the `valid` state before the order becomes `ready`.
+- **With Remote Attestation (RATS):** The `pop` authorization and a `remote-attestation` identifier {{I-D.ietf-acme-rats}} compose orthogonally: both are auxiliary markers that may appear in the same order, are validated independently, and require no special interaction beyond the general rules in Section 3.3.
+- **With C509 Certificates:** The `pop` authorization is compatible with C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}}. The client declares the certificate public key in `popKey` as a DER-encoded SPKI, and the server verifies that the CBOR-encoded public key in the issued C509 certificate is cryptographically equivalent to the validated `popKey`, as specified in Section 6.2. When combined with STAR, the CA computes the C509 certificate validity from the STAR order's `auto-renewal` parameters per {{!RFC8739}}, Section 3.5; this applies to C509's compact time encoding without changing its semantics.
+
+
+# The `pop-01` Challenge {#the-pop-01-challenge}
+
+## The `pop` Authorization {#the-pop-authorization}
+
+An ACME server that accepts a paired `popKey` and `pop` request creates exactly one authorization for that `pop` identifier with the following shape:
+
+~~~
+{
+  "identifier": {
+    "type": "pop",
+    "value": ""
+  },
+  "status": "pending",
+  "challenges": [
+    {
+      "type": "pop-01",
+      "url": "https://acme.example.com/acme/chall/abc123",
+      "status": "pending",
+      "key": "<base64url(DER-encoded SPKI)>",
+      "popNonce": "<base64url(32 random bytes)>"
+    }
+  ]
+}
+~~~
+
+The `pop` authorization MUST contain exactly one challenge, and that challenge MUST have type `pop-01`. Certificate-identifier authorizations do not receive a `pop-01` challenge from this specification. The empty `pop` identifier value carries neither the key nor an order digest. The `pop` identifier itself MUST NOT be encoded anywhere in the issued certificate, including its `subject` field or `subjectAltName` extension.
+
+In {{!RFC8555}}, an authorization ordinarily represents an account's authority over an identifier. This specification deliberately gives the `pop` authorization a narrower, order-level role: its empty identifier has no standalone control semantics, and the authorization records only whether possession of the key declared by that order has been proved.
+
+## Challenge Object Fields {#challenge-object-fields}
+
+The set of fields in the `pop-01` challenge object depends on whether the accepted `popKey` is a signature key or a KEM key, as determined by the server from the `key` field (which mirrors the `popKey`).
+
+For signature keys:
+
+~~~
+{
+  "type": "pop-01",
+  "url": "https://acme.example.com/acme/chall/abc123",
+  "status": "pending",
+  "key": "<base64url(DER-encoded SPKI)>",
+  "popNonce": "<base64url(32 random bytes)>"
+}
+~~~
+
+Field descriptions:
+
+- **type**: Fixed value "pop-01".
+- **url**, **status**: Standard semantics as defined in {{!RFC8555}}, Section 7.1.5. The `status` field follows the full ACME challenge state machine, including `pending`, `processing`, `valid`, and `invalid`. Clients MUST be prepared to observe the `processing` state after submitting a challenge response and MUST poll the challenge URL until a terminal state (`valid` or `invalid`) is reached.
+- **key** (REQUIRED): The Base64URL encoding of the DER-encoded SPKI of the public key to be certified. This MUST be exactly equal to the `popKey` string accepted from the "newOrder" request.
+- **popNonce** (REQUIRED for signature keys): A random value generated by the ACME server for this challenge, Base64URL-encoded. The value MUST be exactly 32 bytes (256 bits) of random data {{!RFC4086}} before Base64URL encoding, providing a fixed-length field for unambiguous concatenation.
+
+For KEM keys:
+
+~~~
+{
+  "type": "pop-01",
+  "url": "https://acme.example.com/acme/chall/def456",
+  "status": "pending",
+  "key": "<base64url(DER-encoded SPKI)>",
+  "challenge_ciphertext": "<base64url(ML-KEM ciphertext)>"
+}
+~~~
+
+Field descriptions:
+
+- **type**, **url**, **status**, **key**: Same as above.
+- **challenge_ciphertext** (REQUIRED for KEM keys): The Base64URL encoding of the ciphertext produced by the server's KEM Encapsulate operation using the public key from the `key` field.
+
+The `popNonce` and `challenge_ciphertext` fields are mutually exclusive: each `pop-01` challenge object MUST contain exactly one of them.
+
+## Authorization Reuse and Lifecycle {#authorization-reuse-and-lifecycle}
+
+The authorization-reuse cases described in {{!RFC8555}}, Section 7.1.3 do not apply to the `pop` authorization bound to a specific order and `popKey`. A `pop` authorization:
+
+- MUST NOT be reused from another order.
+- MUST NOT be obtained via pre-authorization {{!RFC8555}}, Section 7.4.1.
+- MUST NOT be satisfied by an external authorization.
+- Requires a fresh authorization and a fresh `pop-01` challenge for every order containing an accepted `popKey` and `pop` pair.
+
+This non-reuse rule is a deliberate design choice rather than an implementation limitation. Each order requires fresh proof that the private key is held for that specific certificate request; reusing a `pop` authorization across orders would weaken that order-specific binding.
+
+A `pop` authorization is bound exclusively to its originating order. For an order that is not a STAR order, the `expires` value of the `pop` authorization MUST NOT be later than the `expires` value of the associated order. For a STAR order, the `expires` value of the `pop` authorization MUST NOT be later than the order's `auto-renewal.end-date`. The STAR order's `expires` value does not define the end of its automatic-renewal period; after the `end-date`, the STAR order resource remains in the `valid` state, as specified in {{!RFC8739}}.
+
+If an order that is not a STAR order enters a terminal state due to failure (`invalid` or `expired`), the server MUST transition the `pop` authorization and its `pop-01` challenge to corresponding terminal states, if they are not already terminal. When such an order reaches `valid`, the `pop` authorization is already `valid` and no further transition is required.
+
+For a STAR order, successful cancellation MUST prevent further certificate issuance and MUST transition the associated `pop` authorization to `deactivated`, if it is not already terminal. When the STAR order reaches its `auto-renewal.end-date`, the server MUST NOT use the `pop` authorization for further certificate issuance and MUST transition the authorization to `expired`, if it is not already terminal. Reaching the `end-date` does not change the STAR order resource's status from `valid`.
+
+Clients MUST NOT send a deactivation request for a `pop` authorization. A server receiving such a request MUST reject it with `urn:ietf:params:acme:error:malformed`; cancellation of the associated STAR order implicitly deactivates the `pop` authorization.
+
+The `pop` authorization follows the standard ACME authorization state machine in {{!RFC8555}}, including the applicable `invalid`, `deactivated`, `expired`, and `revoked` terminal states. It is subject to the same `expires` and `Retry-After` semantics as other ACME authorizations. Section 5.4 defines the additional cleanup required when this order-bound authorization, its challenge, or its associated order terminates.
+
+# Proof-of-Possession Execution {#proof-of-possession-execution}
+
+## PoP for Signature Keys {#pop-for-signature-keys}
+
+In signature key mode, the `pop-01` challenge object contains the `popNonce` field. The client constructs the proof as follows:
+
+1. Let `raw_newOrder` be the exact octets obtained by Base64URL-decoding the JWS `payload` member of the "newOrder" request, before JSON parsing.
+
+2. Compute `newOrder_hash = SHA-256(raw_newOrder)`.
+
+3. Let `popNonce_bytes` be the raw bytes obtained by Base64URL-decoding the `popNonce` field.
+
+4. Construct the message to be signed:
+
+   ```text
+   to_sign = "ACME-pop-01-sig v1:" || popNonce_bytes || newOrder_hash
+   ```
+
+   where `||` denotes raw byte concatenation and "ACME-pop-01-sig v1:" is a fixed 19-byte ASCII domain separation prefix. Since `newOrder_hash` occupies the final 32 bytes and has a fixed length, the boundary between `popNonce_bytes` and `newOrder_hash` is always unambiguous.
+
+5. Compute the signature:
+
+   ```text
+   proof = base64url( Sign(privateKey, to_sign) )
+   ```
+
+   `Sign(key, message)` denotes a complete signing operation over `message` (with hashing internal to the algorithm).
+
+Each challenge gets a fresh `popNonce` (Section 4.2), so a captured proof cannot be replayed against another challenge of the same order.
+
+The signature algorithm is determined by the key type declared in the `key` field's SPKI. The following table defines the normative baseline proof mappings:
+
+| Key type          | SPKI algorithm identification          | Signature algorithm          |
+| ----------------- | -------------------------------------- | ---------------------------- |
+| EC P-256          | id-ecPublicKey, namedCurve = secp256r1 | ECDSA with SHA-256           |
+| EC P-384          | id-ecPublicKey, namedCurve = secp384r1 | ECDSA with SHA-384           |
+| EC P-521          | id-ecPublicKey, namedCurve = secp521r1 | ECDSA with SHA-512           |
+| Ed25519           | 1.3.101.112                            | Ed25519 {{!RFC8032}}            |
+| RSA               | rsaEncryption (1.2.840.113549.1.1.1)   | RSASSA-PSS with SHA-256      |
+| ML-DSA-44         | 2.16.840.1.101.3.4.3.17                | ML-DSA-44 {{FIPS-204}}         |
+| ML-DSA-65         | 2.16.840.1.101.3.4.3.18                | ML-DSA-65 {{FIPS-204}}         |
+| ML-DSA-87         | 2.16.840.1.101.3.4.3.19                | ML-DSA-87 {{FIPS-204}}         |
+| SLH-DSA-SHA2-128s | 2.16.840.1.101.3.4.3.20                | SLH-DSA-SHA2-128s {{FIPS-205}} |
+| SLH-DSA-SHA2-128f | 2.16.840.1.101.3.4.3.21                | SLH-DSA-SHA2-128f {{FIPS-205}} |
+| SLH-DSA-SHA2-192s | 2.16.840.1.101.3.4.3.22                | SLH-DSA-SHA2-192s {{FIPS-205}} |
+| SLH-DSA-SHA2-192f | 2.16.840.1.101.3.4.3.23                | SLH-DSA-SHA2-192f {{FIPS-205}} |
+| SLH-DSA-SHA2-256s | 2.16.840.1.101.3.4.3.24                | SLH-DSA-SHA2-256s {{FIPS-205}} |
+| SLH-DSA-SHA2-256f | 2.16.840.1.101.3.4.3.25                | SLH-DSA-SHA2-256f {{FIPS-205}} |
+{: #tab-1 title="Signature-Key Proof Algorithm Mappings"}
+
+The Ed25519 SPKI OID and encoding are defined by {{!RFC8410}}, the ML-DSA OIDs are defined by {{!RFC9881}}, and the SLH-DSA OIDs are defined by {{!RFC9909}}. A client using a listed key type MUST use the corresponding mapping, and a server that accepts that key type MUST verify the proof accordingly.
+
+A server is not required to support every key type in this table. However, if a server supports a public key algorithm not listed in this table, the mapping for that algorithm (including the exact signature algorithm and byte encoding) MUST be defined in a separate extension specification. Otherwise, the server MUST reject such keys with `urn:ietf:params:acme:error:badPopKey`. This ensures interoperability and avoids ambiguity in proof verification.
+
+**Context parameter for ML-DSA and SLH-DSA.** For ML-DSA {{FIPS-204}} and SLH-DSA {{FIPS-205}}, the signing operation uses the default context string as defined in the respective specification. The default context is the empty string (length 0). Implementations MUST NOT use a non-empty context string when constructing the `to_sign` input, to ensure interoperability across independent implementations.
+
+**RSA SPKI AlgorithmIdentifier.**
+
+This document supports RSA keys identified by the `rsaEncryption` AlgorithmIdentifier (1.2.840.113549.1.1.1) with NULL parameters as specified in {{!RFC3279}}, Section 2.3.1.
+
+For RSA keys with `rsaEncryption` AlgorithmIdentifier, the proof of possession MUST use RSASSA-PSS with SHA-256 (PS256) as defined in {{!RFC7518}}, Section 3.5, with MGF1 using SHA-256 and a salt length equal to the hash output length (32 bytes).
+
+The `rsaEncryption` OID is retained in the certificate SPKI for broad ecosystem compatibility; the PSS algorithm for the PoP proof is enforced by this protocol specification, independent of the certificate's AlgorithmIdentifier.
+
+RSA keys identified by the `rsassaPss` AlgorithmIdentifier (1.2.840.113549.1.1.10) in the SPKI MUST be rejected with `urn:ietf:params:acme:error:badPopKey`. The `rsassaPss` OID carries additional parameters (hashAlgorithm, maskGenAlgorithm, saltLength) that would introduce unnecessary complexity to the PoP verification and are not required for the ACME proof-of-possession context. Clients SHOULD use the `rsaEncryption` AlgorithmIdentifier for RSA keys used in ACME `popKey` fields.
+
+Byte encoding of signature values:
+
+- ECDSA: IEEE P1363 {{P1363}} format (`r || s`).
+- RSASSA-PSS: PS256 algorithm as defined in {{!RFC7518}}, Section 3.5.
+- Ed25519: 64-octet `R || S` encoding {{!RFC8032}}, Section 5.1.6.
+- ML-DSA: byte encoding defined in {{FIPS-204}}.
+- SLH-DSA: signature data format specified in {{FIPS-205}} Sections 9.2 and 9.3.
+
+## PoP for KEM Keys {#pop-for-kem-keys}
+
+In KEM key mode, the `pop-01` challenge object contains the `challenge_ciphertext` field. The KEM algorithm is uniquely determined by the AlgorithmIdentifier in the `key` field's SPKI. The AlgorithmIdentifier OID includes the parameter set identifier, and its parameters field MUST be absent as specified in {{!RFC9935}}. The `subjectPublicKey` BIT STRING MUST contain exactly the raw ML-KEM encapsulation-key octets, with no additional ASN.1 wrapping, and its length MUST match the selected parameter set in the table below.
+
+| Key type    | Public key length (bytes) | Ciphertext length (bytes) | SPKI AlgorithmIdentifier OID |
+| ----------- | ------------------------: | ------------------------: | ---------------------------- |
+| ML-KEM-512  |                       800 |                       768 | 2.16.840.1.101.3.4.4.1       |
+| ML-KEM-768  |                      1184 |                      1088 | 2.16.840.1.101.3.4.4.2       |
+| ML-KEM-1024 |                      1568 |                      1568 | 2.16.840.1.101.3.4.4.3       |
+{: #tab-2 title="ML-KEM Parameter Mappings"}
+
+**Composite KEM keys.** The KEM construction in this section is algorithm-agnostic: it requires only that client and server can perform the encapsulation and decapsulation operations and agree on the resulting shared secret. When the composite ML-KEM specification {{I-D.ietf-lamps-pq-composite-kem}} is published, composite keys can be supported at the AlgorithmIdentifier level alone: a composite `popKey` would use the composite key encoding and composite AlgorithmIdentifier defined in that document, and the server-side and client-side flows below would apply unchanged, with the length checks in Section 3.2 and step 2 below evaluated against the composite public-key and ciphertext lengths defined by that document. The composite KEM algorithms defined in {{I-D.ietf-lamps-pq-composite-kem}} would be treated as a single KEM entity in this protocol; their internal ECDH, X25519, or X448 components would not be individually exposed to the PoP protocol. The exclusion of DHKEM in Section 1.2 applies to standalone DH-based KEMs, not to composite KEMs that encapsulate a DH component within a unified encapsulation operation.
+
+Server-side (challenge creation):
+
+1. After the ML-KEM encapsulation-key checks required by Section 3.2 have succeeded, execute ML-KEM.Encaps using the public key from the `key` field, obtaining a shared secret `shared_secret` and a ciphertext `ct`.
+
+2. Verify that the length of `ct` matches the ciphertext length for the declared KEM algorithm.
+
+3. Derive a MAC key using HKDF {{!RFC5869}}:
+
+   ```text
+   prk = HKDF-Extract[SHA-256](salt, IKM = shared_secret)
+   mac_key = HKDF-Expand[SHA-256](prk,
+             info = ASCII("ACME-pop-01-KEM v1"), L = 32)
+   ```
+
+   The salt parameter to HKDF-Extract is omitted. Implementations MUST use the default salt defined in {{!RFC5869}}, Section 2.2: a string of HashLen zero octets.
+
+4. Each invocation of ML-KEM.Encaps generates a fresh ephemeral secret and ciphertext, which is encoded in the `challenge_ciphertext` field. Servers MUST NOT reuse a ciphertext across challenges. A fresh encapsulation makes the derived `mac_key` unique to this challenge, limiting the impact of any single `mac_key` compromise; the `newOrder_hash` binding (Section 5.5) independently prevents replay of proofs across orders.
+
+5. Fill the `challenge_ciphertext` field with the Base64URL encoding of `ct`, and stage `mac_key` as challenge-specific state linked to the order.
+
+6. After construction of the challenge object is complete, atomically commit the order, authorization, challenge, and proof state. On success, destroy `shared_secret`, `prk`, and all intermediate secret state other than the retained `mac_key`.
+
+Client-side (proof generation):
+
+1. Let `ct` be the raw bytes obtained by Base64URL-decoding the `challenge_ciphertext` field.
+
+2. Perform KEM Decapsulate(ct) using the private key corresponding to the public key in the `key` field, obtaining `shared_secret`.
+
+3. Derive `mac_key` using the same parameters as the server:
+
+   ```text
+   prk = HKDF-Extract[SHA-256](salt, IKM = shared_secret)
+   mac_key = HKDF-Expand[SHA-256](prk,
+             info = ASCII("ACME-pop-01-KEM v1"), L = 32)
+   ```
+
+   The salt parameter to HKDF-Extract is omitted. Implementations MUST use the default salt defined in {{!RFC5869}}, Section 2.2: a string of HashLen zero octets.
+
+4. Compute `newOrder_hash = SHA-256(raw_newOrder)`.
+
+5. Compute the proof:
+
+   ```text
+   proof = base64url( HMAC-SHA-256(mac_key, newOrder_hash) )
+   ```
+
+The client SHOULD verify that the length of the decoded `challenge_ciphertext` matches the expected length for the KEM algorithm identified in the `key` field, to reject malformed ciphertexts early and avoid unexpected behavior in decapsulation.
+
+The client MUST NOT use `shared_secret` directly as the HMAC key; `mac_key` MUST be derived via HKDF. After submitting the proof, the client SHOULD immediately destroy `shared_secret`, `prk`, and `mac_key` from memory.
+
+
+## Client Response Submission {#client-response-submission}
+
+After constructing the proof, the client submits it to the challenge URL in an account-key-authenticated ACME JWS. The decoded JWS payload is a JSON object containing the `proof` field:
+
+~~~
+POST /acme/chall/abc123 HTTP/1.1
+Host: acme.example.com
+Content-Type: application/jose+json
+
+{
+  "protected": "<base64url(protected-header)>",
+  "payload": "<base64url({\"proof\":\"...\"})>",
+  "signature": "<base64url(account-key-signature)>"
+}
+~~~
+
+The `proof` field carries the signature (signature key mode) or HMAC (KEM key mode). The `proof` field is the single response field defined for the `pop-01` challenge type, as specified in {{!RFC8555}}, Section 7.5.1. Servers MUST ignore any other fields in the challenge response payload. A server MUST reject an invalid JSON object, a missing or non-string `proof`, invalid Base64URL, or a proof with an invalid encoding or length with `urn:ietf:params:acme:error:malformed`.
+
+The client MUST submit the challenge response using the same account key with which the order was created. The client MUST retain `raw_newOrder` for the duration of the order lifecycle, as it is needed to recompute `newOrder_hash` for proof construction. The client SHOULD destroy all intermediate secret material (`shared_secret`, `prk`, and `mac_key` in KEM mode) immediately after submitting the proof, as specified in Section 5.2.
+
+## Server Validation {#server-validation}
+
+This section describes how the server validates the submitted proof and manages the lifetime of proof material.
+
+### Validation Steps {#validation-steps}
+
+Upon receiving a syntactically valid response, the server:
+
+1. Follows the authoritative `challenge -> authorization -> order -> account` relationship and retrieves the accepted `popKey`, stored `newOrder_hash`, and challenge-specific material (`popNonce_bytes` for signature mode or `mac_key` for KEM mode).
+2. MUST immediately transition the `pop-01` challenge to the `processing` state, indicating that cryptographic validation is in progress.
+3. Selects the validation path based on the field present in the challenge object:
+   - Signature key mode: Constructs `to_sign` and verifies the signature.
+   - KEM key mode: Computes HMAC-SHA-256(mac_key, newOrder_hash) and compares it (using constant-time comparison) with the submitted proof.
+4. Upon completion of the cryptographic validation:
+   - If validation succeeds, the server sets the `pop-01` challenge and its containing `pop` authorization to `valid`.
+   - If validation fails, the server sets both to `invalid`, records `urn:ietf:params:acme:error:badPoP` on the challenge, and sets the order to `invalid`.
+5. Applies the proof-material lifecycle rule in Section 5.4.2 after updating resource states.
+
+The server MAY complete validation synchronously, in which case the `processing` state MAY be transient and not observable by the client.
+
+### Proof-Material Lifecycle {#proof-material-lifecycle}
+
+The server MUST immediately destroy the locally stored `popNonce_bytes` (signature-key mode) or `mac_key` (KEM-key mode), and mark that proof material as consumed, upon the earliest of:
+
+- the associated STAR order {{!RFC8739}} entering `canceled`;
+- the `pop-01` challenge entering `valid` or `invalid`;
+- the containing `pop` authorization entering `invalid`, `deactivated`, `expired`, or `revoked`;
+- the associated order entering `invalid`, including because an unfinalized order expired or another authorization reached a final state other than `valid`; or
+- the ACME account owning the associated order entering `deactivated` or `revoked`.
+
+**Challenge termination.** If the containing `pop` authorization enters `invalid`, `deactivated`, `expired`, or `revoked` while its `pop-01` challenge is `pending` or `processing`, the server MUST set the challenge to `invalid` without replacing the authorization's terminal state.
+
+**Order termination.** If the associated order enters `invalid`, the server MUST set any `pending` or `processing` `pop-01` challenge to `invalid` and MUST set its containing `pop` authorization to `invalid` if that authorization is still `pending`. When a nonterminal `pop-01` challenge is made `invalid` solely because its containing authorization or associated order terminated, the server MUST NOT attach a `badPoP` error, because no cryptographic proof validation failed. If an error is included for an independently applicable reason, the problem document MUST describe that actual reason; otherwise the server SHOULD omit the challenge's `error` field.
+
+
+**STAR termination.** If the associated STAR order enters `canceled`, the server MUST destroy the proof material as specified above, and MUST set any `pending` or `processing` `pop-01` challenge to `invalid` without attaching a `badPoP` error.
+
+**Post-termination handling.** After any lifecycle trigger above, the server MUST NOT process another proof submission or change the challenge state in response to such a submission. Account-authenticated POST-as-GET retrieval of the terminal challenge resource remains governed by {{!RFC8555}}. Destruction triggered by account deactivation or revocation does not by itself define additional order, authorization, or challenge state transitions; account deactivation and resource-state handling follow {{!RFC8555}}, Section 7.3.6 and server policy.
+
+## Order Binding {#order-binding}
+
+Both the signature-mode `to_sign` and the KEM-mode HMAC input include SHA-256(raw_newOrder). This binds the proof to the exact decoded JWS payload octets of the "newOrder" request. Any change to those octets causes proof verification to fail.
+
+Implementations MUST NOT hash a re-serialized JSON object.
+
+The proof binds only to the JWS payload, not the protected header. The integrity of the protected header (algorithm, account identifier, nonce) is already guaranteed by the outer account-key JWS signature. Binding the certificate-key proof to the payload alone ensures the proof attests to the content of the order itself, independent of the account authentication layer.
+
+**Proof construction versioning.** Both proof constructions carry a version marker in their domain separation prefixes ("v1"): `"ACME-pop-01-sig v1:"` for signature keys and `"ACME-pop-01-KEM v1"` for KEM keys. The trailing colon in the signature-mode prefix is part of the domain separation string; it is absent in KEM mode, where the string serves as the HKDF `info` and needs no delimiter. The marker is a domain separation label, not an in-band negotiation mechanism; any incompatible change to a construction requires a new challenge type in a separate extension specification.
+
+
+# Finalization {#finalization}
+
+## Finalize Request {#finalize-request}
+
+An order for which the server accepted the `popKey` and `pop` pair contains one `pop` authorization. When its sole `pop-01` challenge becomes `valid`, the server sets the `pop` authorization to `valid`. The order becomes `ready` only when that `pop` authorization and every other authorization listed by the order are `valid`; challenges within a certificate-identifier authorization remain alternatives under {{!RFC8555}}. The server does not push the `ready` transition; the client retrieves the order URL using POST-as-GET until the returned order object is `ready`.
+
+After an order using the CSR-less flow becomes `ready`, the client MUST send an account-key-authenticated finalize JWS. The decoded JWS payload MUST parse as a JSON object with no members:
+
+~~~
+POST /acme/order/xyz/finalize HTTP/1.1
+Host: acme.example.com
+Content-Type: application/jose+json
+
+{
+  "protected": "<base64url(protected-header)>",
+  "payload": "e30",
+  "signature": "<base64url(account-key-signature)>"
+}
+~~~
+
+The value `e30` is the Base64URL encoding of the two UTF-8 octets `{}` and is the recommended deterministic representation.
+
+Before processing a finalize request, the server MUST verify that all authorizations associated with the order, including the `pop` authorization, are still in the `valid` state and have not expired. If any authorization has entered a terminal state other than `valid`, the server MUST transition the order to `invalid` and return an appropriate error.
+
+For an order with an accepted `popKey` and `pop` pair, the server MUST reject any finalize payload that is not an empty JSON object with `urn:ietf:params:acme:error:malformed`. This includes, but is not limited to, payloads containing a `csr` field. The empty-payload requirement applies only to the finalize endpoint. Other authenticated POSTs to the order resource (e.g., STAR cancellation per {{!RFC8739}}, Section 3.1.2) are unaffected.
+
+If the order has not reached the `ready` state (e.g., the `pop` authorization is still `pending`), the server MUST return an `orderNotReady` error, consistent with {{!RFC8555}}, Section 7.4.
+
+If the order is already in the `valid` state, the server MUST return the current order object without modification, consistent with {{!RFC8555}}, Section 7.4.
+
+## Certificate Issuance {#certificate-issuance}
+
+For a successful finalize request, the server returns HTTP 200 with an updated order object as specified by {{!RFC8555}}. When issuing the certificate, the server uses:
+
+- **Public key:** The DER SubjectPublicKeyInfo octets to be placed in the certificate. The server MUST confirm that the public key to be placed in the certificate is cryptographically equivalent to the public key declared in the accepted order's `popKey`. For DER-encoded X.509 certificates, this is achieved by byte-for-byte comparison of the DER SubjectPublicKeyInfo octets. For C509 certificates, the server MUST verify that the CBOR-encoded subjectPublicKey represents the same cryptographic key as the DER-encoded popKey. Implementations SHOULD decode the key parameters from both encodings and compare the underlying mathematical values (e.g., RSA modulus and exponent, EC curve and point coordinates, ML-KEM parameter set and public key bytes). Support for C509 certificate issuance is optional; implementations that do not support C509 are unaffected by this dependency.
+- **Identifiers:** The certificate identifiers authorized for the order. The `pop` identifier MUST NOT be encoded anywhere in the issued certificate, including its `subject` field or `subjectAltName` extension.
+
+All other certificate fields and extensions (subject, validity period, key usage, extended key usage, etc.) are determined by CA policy and any applicable certificate profile selected for the order. This document does not mandate specific values for these fields; they are outside the scope of the proof-of-possession mechanism. When used together with the Certificate Profiles extension, the profile identifier in the order governs the composition of the remainder of the certificate. Clients that previously conveyed certificate extensions via the CSR's extensionRequest can express them through a certificate profile; this document does not define a mechanism for client-supplied arbitrary extensions.
+
+# Security Considerations {#security-considerations}
+
+## Security Model and Threat Analysis {#security-model-and-threat-analysis}
+
+This section states the security guarantees of the `pop` authorization under the threat model below, then examines the deployment-specific combinations referenced in Sections 3.5 and 10.
+
+The `pop-01` challenge proves that an entity participating in the ACME transaction possessed, at challenge completion, the private key corresponding to the accepted `popKey`. It does not prove control of any certificate identifier. Identifier control and key possession are represented by separate authorizations: certificate-identifier authorizations validate the requested certificate identifiers, while the `pop` authorization validates possession of the certificate key. The order can become `ready` only when both kinds of authorization are valid.
+
+The following threat model defines the security guarantees provided by this design against attackers with different capabilities:
+
+| Attacker capability                                          | Security guarantee                                           |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Holds identifier control, no certificate private key         | Cannot make `pop` authorization valid; cannot obtain certificate |
+| Holds certificate private key, no identifier control         | Cannot satisfy identifier authorization; cannot obtain certificate |
+| Can tamper with finalization-stage network traffic           | Cannot substitute public key; key is locked at order creation |
+| Can eavesdrop on all protocol traffic                        | Cannot forge PoP proof; cannot obtain KEM shared secret      |
+| Can trick the victim into signing a PoP response for an order | Challenge responses are authenticated by the account that created the order, so cross-account submission fails outer JWS verification; and the proof binds to that order's `newOrder_hash`, so a proof for the victim's own order cannot satisfy the attacker's order. |
+{: #tab-3 title="Threat Model and Security Guarantees"}
+
+**Architectural Benefit: Eliminating Late-Binding and Semantic Inconsistency.** In the traditional CSR-based flow, the public key is declared at finalization time, after all authorizations are complete. This creates a semantic window: the order becomes `ready` based on authorizations that validate identifiers, but the certificate public key is not committed until the finalize request. An attacker who can intercept or influence the finalization step could, in principle, replace the client's CSR with one of their own containing a different public key, because the CSR is not cryptographically bound to the order at creation time.
+
+The `pop` authorization design closes this window by binding the public key to the order at creation time, before the order becomes `ready`. The key is declared in the `newOrder` request and fixed once the `pop` authorization becomes `valid`; there is no CSR to substitute and no later swap point.
+
+This architectural improvement does not imply a security vulnerability in {{!RFC8555}}. In the standard ACME threat model, where the account key is assumed uncompromised and the client environment is trusted, CSR substitution is not exploitable as a protocol-level attack. The value of the `pop` design lies in making the order a complete specification of the certificate at the time it becomes `ready`, reducing the potential for semantic confusion.
+
+In deployments where an untrusted proxy component sits between the ACME client and server, and that proxy has the ability to substitute messages, the `pop` authorization design eliminates the possibility of substituting the public key at finalization. This deployment-specific risk is not part of the standard ACME threat model {{!RFC8555}} but may be relevant to environments where proxies handle certificate requests.
+
+**Instantaneous nature of PoP.** The `pop-01` challenge proves possession of the private key at the time the challenge is completed. It does not guarantee continued possession throughout the certificate's validity period. This is consistent with the security model of CSR-based issuance, where the self-signature also only proves possession at the time of CSR submission. Deployments requiring ongoing assurance of key possession should consider short-lived certificates or other operational controls.
+
+**STAR composition with KEM keys.** For a KEM certificate key combined with automatic renewal (STAR), the `pop-01` proof is validated only at bootstrap; subsequent certificates issued under the same order inherit that initial validation without any fresh proof of possession. This is consistent with {{!RFC8739}}, which reissues certificates from the initial CSR without re-running authorization. However, because a KEM proof is a challenge-response rather than a non-repudiable signature, servers SHOULD, for KEM-key STAR orders, bound the auto-renewal duration (e.g., via a conservative `end-date` and minimum `lifetime`) and SHOULD require a fresh `pop` authorization when a new order is created for the same key, to limit the exposure of an unverifiable issuance chain. This does not impose new requirements on CSR-based STAR orders, where the same property applies, but acknowledges the reduced auditability of KEM proofs during auto-renewal. Section 7.5 discusses the revocation and single-control-point implications of the KEM+STAR combination.
+
+**Deployment-specific value of PoP.** The value of PoP varies by context: in a typical Web PKI flow, an attacker who can satisfy identifier validation can usually generate a fresh key pair, so PoP mainly prevents issuance of a key the requester cannot prove possession of; in device-attestation deployments, the `pop` authorization supplies that proof alongside the attestation authorization; and for KEM-only keys it is the only available proof, since the {{!RFC8555}} finalization self-signature does not exist.
+
+**Declarative-composable trust model.** As described in Section 1.5, the design makes the order the single authoritative source of client-declared certificate parameters and evaluates all verifications (identifier control, key possession, and optional attestation) before the order becomes `ready`. Because no finalization-time request can introduce new claims or alter verified ones, the attack surface associated with late-stage request processing is reduced and the security analysis of the issuance path is simplified.
+
+## Cryptographic Binding {#cryptographic-binding}
+
+The proof input includes SHA-256(raw_newOrder). The proof therefore covers the requested `identifiers`, `popKey`, and every other order field as encoded by the client. The server maintains this binding through the authenticated `challenge -> authorization -> order -> account` relationship.
+
+The strength of this transcript binding is bounded by the collision resistance of SHA-256, regardless of the security level of the certificate-key algorithm.
+
+## Nonce and KEM Key Management {#nonce-and-kem-key-management}
+
+The `popNonce` field MUST be exactly 32 bytes (256 bits of entropy) and MUST NOT be reused across challenges, providing a fixed-length concatenation boundary (Section 4.2). The server marks signature-mode proof material consumed and handles later proof submissions according to the lifecycle rules in Section 5.4.
+
+In KEM mode, the client and server MUST use the HKDF-SHA-256 parameters in Section 5.2 and MUST NOT use `shared_secret` directly as the HMAC key. The server MUST compare the submitted proof with the expected HMAC in constant time.
+
+### KEM-Specific Security Requirements {#kem-specific-security-requirements}
+
+- **Constant-time implementation:** Server-side KEM encapsulation and proof verification MUST be implemented using constant-time cryptographic primitives to avoid timing side channels that could leak information about the shared secret or the private key.
+- **Minimal secret retention:** The server MUST NOT persist or log the raw KEM shared secret. Only the derived `mac_key` MAY be retained for the duration of the challenge, and MUST be destroyed immediately upon challenge termination.
+- **Freshness and uniqueness:** Each `pop-01` challenge for a KEM key MUST use a fresh invocation of ML-KEM.Encaps, generating a unique ephemeral secret and ciphertext. Ciphertexts MUST NOT be cached, reused across challenges, or shared between orders. This ensures that each derived `mac_key` is unique per challenge, limiting the impact of any single key compromise; the `newOrder_hash` binding (Section 5.5) independently prevents replay attacks across orders, as a proof computed for one order's hash cannot satisfy another order's challenge even if the ciphertext were reused.
+- **Server-side `mac_key` compromise:** The server stores only the derived `mac_key` during the challenge lifetime. If this `mac_key` is compromised while the challenge is still `pending` or `processing`, an attacker could generate a valid proof for that specific challenge, potentially leading to unauthorized issuance for that order. However, the per-challenge uniqueness of the `mac_key` ensures that compromise of one challenge does not affect others; immediate destruction upon challenge termination (as specified in Section 5.4) limits the window of exposure. Servers SHOULD protect the in-memory `mac_key` with the same security controls applied to other sensitive authentication material and SHOULD consider hardware-backed security mechanisms for high-value deployments. In STAR orders, this risk is limited to the bootstrap phase only, as no `mac_key` is retained for automatic renewals; a `mac_key` compromise therefore does not affect an already-established STAR renewal chain.
+
+## Algorithm and Key Rejection {#algorithm-and-key-rejection}
+
+The server MUST reject a `popKey` that it cannot parse or for which it does not implement the mapping required by Section 5. A server MAY also reject a syntactically valid key under CA policy. Both failures use `urn:ietf:params:acme:error:badPopKey`.
+
+Rejection of an otherwise valid `popKey` for a reason unrelated to the key value itself (e.g., the account or request is not authorized for CSR-less issuance) uses `urn:ietf:params:acme:error:popKeyRejectedByPolicy` as defined in Section 3.2, step 5. The two error types are distinct: `badPopKey` indicates a problem with the key value itself (syntax, algorithm, parameters, or equivalence to the account key), whereas `popKeyRejectedByPolicy` indicates that the key is acceptable but its use is not permitted by CA policy.
+
+**Algorithm identifier stability.** Section 5 defines the algorithm mappings implemented by this document. For an accepted order, the `popKey` and challenge `key` strings are equal, proof processing uses the algorithm identified by the decoded SPKI, and, for DER-encoded X.509 certificates, the issued certificate contains the same DER SPKI octets; for other certificate encodings, cryptographic equivalence is determined as specified in Section 6.2. The mappings are not an ACME-wide whitelist; a future algorithm mapping requires an extension specification.
+
+## Revocation of KEM-Bound Certificates {#revocation-of-kem-bound-certificates}
+
+{{!RFC8555}}, Section 7.6 defines two authentication methods for revocation: the ACME account key, and the certificate's private key. For KEM-bound certificates, the certificate-private-key path is not available, as KEM keys cannot produce digital signatures.
+
+Deployments using KEM keys MUST therefore ensure the availability of the ACME account key for revocation operations. Loss of the account key leaves no in-protocol mechanism for revoking the certificate. Mitigations include:
+
+- Account-key recovery mechanisms provided by the ACME service provider.
+- Short-lived certificates to reduce the impact of unrevocable certificates; the interaction of short-lived certificates with KEM keys is discussed below.
+- Separate revocation channels (CRL, OCSP) operated by the CA independently of ACME.
+
+Combining KEM certificate keys with STAR {{!RFC8739}} concentrates the active control path on a single point: the ACME account key. STAR certificates cannot be explicitly revoked ({{!RFC8739}}, Section 5.2 defines the `autoRenewalRevocationNotSupported` error), and KEM keys cannot use the certificate-private-key revocation method of {{!RFC8555}}, Section 7.6. Cancellation of the STAR order via the account key is therefore the sole in-protocol mechanism to stop issuance after a key compromise. Deployments combining KEM keys with STAR MUST give the highest priority to securing and backing up the ACME account key, and SHOULD prefer short STAR `lifetime` values to bound the exposure window. Loss of the account key leaves automatic renewal running with a potentially compromised key until the order's `end-date`.
+
+## Relationship to Established PoP Security {#relationship-to-established-pop-security}
+
+The `pop-01` challenge builds on established IETF proof-of-possession work and provides guarantees appropriate for the ACME issuance context. Its security properties depend on the mode of operation. In particular:
+
+- **JWS payload processing {{!RFC7515}}:** To avoid JSON serialization ambiguities, the proof is bound to the exact octets obtained by Base64URL-decoding the JWS `payload` member of the "newOrder" request, before JSON parsing (see Section 5.5).
+- **PoP key semantics {{?RFC7800}} {{?RFC8747}}:** These RFCs formalize a PoP key bound to a security token. Here the public key carried in `popKey` and the `pop-01` challenge is a PoP key, and the ACME order is the binding context.
+- **OAuth 2.0 DPoP {{!RFC9449}}:** DPoP is an application-layer PoP mechanism for sender-constraining OAuth tokens. It provides an example of proof binding to a protocol context, although its state and replay models differ from this ACME challenge.
+- **CMP {{?RFC9810}}:** The Certificate Management Protocol likewise requires proof of possession of the certified key, illustrating that an ACME-native PoP mechanism serves a need common to PKI management protocols.
+
+**Signature key mode.** For signature keys, the proof is a digital signature over the challenge material. This provides security guarantees equivalent to the CSR self-signature mechanism of {{!RFC8555}}: only the private key holder can generate the proof, and the proof serves as evidence of possession that can be independently verified by third parties.
+
+**KEM key mode.** For KEM keys, the proof is a MAC derived from a shared secret obtained through decapsulation. This is a challenge-response proof that demonstrates to the server that the client possesses the private key, because only the client can decapsulate the ciphertext to derive the correct shared secret and MAC key. However, because the server originates the encapsulation and can compute the expected MAC independently, the proof does not provide non-repudiation: the client cannot present the proof to a third party as evidence of possession, as the server could have generated it itself.
+
+In the ACME issuance context, this distinction does not weaken security: the server is the relying party, and its goal is to verify before issuance that the requester holds the private key corresponding to the declared public key. A client that cannot decapsulate the ciphertext cannot produce the required MAC, and the proof is bound to the order context (`newOrder_hash`) and a fresh server-generated ciphertext, providing protection against replay and substitution. The server can, however, always compute a valid proof itself, so KEM-mode proofs provide no non-repudiation and cannot serve as third-party-verifiable evidence. Deployments that need auditable, externally verifiable proof of possession (e.g., publicly trusted CAs subject to regulatory audit) SHOULD prefer signature-capable certificate keys or a future extension for KEM-based signing proofs; where signature keys are not an option, CAs SHOULD evaluate whether logging the challenge-response exchange (ciphertext, submitted proof, timestamp) suffices for their internal audit trail, recognizing that such logs are not third-party-verifiable.
+
+## Privacy Considerations {#privacy-considerations}
+
+The `popKey` field carries a public key intended for a certificate, but sending the same value in multiple orders permits those transactions to be correlated. A fresh key for each order reduces that correlation and can be preferable when the application does not require key continuity.
+
+Key reuse is nevertheless valid protocol behavior. Renewal, public key pinning, escrow, and pre-provisioned hardware keys can require the same key in multiple certificates or orders. While `popKey` may be reused across orders, each reuse requires a fresh `pop` authorization, challenge material, and proof, ensuring that each certificate issuance is independently verified.
+
+Servers SHOULD retain `popKey` and proof-related data only as long as needed for order processing, certificate issuance, security investigation, and applicable audit requirements.
+
+# IANA Considerations {#iana-considerations}
+
+## ACME Identifier Types Registry {#acme-identifier-types-registry}
+
+IANA is requested to add the following entry to the "ACME Identifier Types" registry (established by {{!RFC8555}}):
+
+| Label | Description                                                  | Reference     |
+| ----- | ------------------------------------------------------------ | ------------- |
+| pop   | Auxiliary identifier type requesting a dedicated proof-of-possession authorization. | this document |
+{: #tab-4 title="ACME Identifier Types Registry Entry"}
+
+`pop` is an auxiliary identifier type whose value is the empty string. It requests a dedicated proof-of-possession authorization and is not encoded in the issued certificate.
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+## ACME Validation Methods Registry {#acme-validation-methods-registry}
+
+IANA is requested to add the following entry to the "ACME Validation Methods" registry (defined in {{!RFC8555}}, Section 9.7.8):
+
+
+
+| Label  | Identifier Type | ACME | Reference     |
+| ------ | --------------- | ---- | ------------- |
+| pop-01 | pop             | Y    | this document |
+{: #tab-5 title="ACME Validation Methods Registry Entry"}
+
+`pop-01` is used only in `pop` authorizations. It MUST NOT appear in certificate-identifier authorizations.
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+## ACME Directory Metadata Fields Registry {#acme-directory-metadata-fields-registry}
+
+IANA is requested to add the following entry to the "ACME Directory Metadata Fields" registry:
+
+| Field Name       | Field Type |  Reference    |
+| ---------------- | ---------- | ------------- |
+| popStarSupported | boolean    | this document |
+| popSupported     | boolean    | this document |
+{: #tab-6 title="ACME Directory Metadata Fields Registry Entries"}
+
+`popSupported` indicates support for the `pop` identifier type, the `pop-01` challenge type, and the `popKey` field. `popStarSupported` indicates whether the server supports using `pop` authorizations with STAR orders and for automatic renewals.
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+## ACME Error Types Registry {#acme-error-types-registry}
+
+IANA is requested to add the following entries to the "ACME Error Types" registry:
+
+| Type                   | Description                                                  | Reference     |
+| ---------------------- | ------------------------------------------------------------ | ------------- |
+| badPopKey              | The popKey value is malformed, contains an unsupported algorithm or invalid parameters, matches the account key, or exceeds length limits. | this document |
+| popKeyRejectedByPolicy | The popKey is syntactically and algorithmically valid but rejected by CA policy (e.g., insufficient key strength, account not authorized for CSR-less issuance). | this document |
+| badPoP                 | The submitted proof-of-possession cryptographic verification failed. | this document |
+{: #tab-7 title="ACME Error Types Registry Entries"}
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+## ACME Order Object Fields Registry {#acme-order-object-fields-registry}
+
+IANA is requested to add the following entry to the "ACME Order Object Fields" registry (defined in {{!RFC8555}}, Section 9.7.2):
+
+| Field Name | Field Type | Configurable | Reference     |
+| ---------- | ---------- | ------------ | ------------- |
+| popKey     | string     | true         | this document |
+{: #tab-8 title="ACME Order Object Fields Registry Entry"}
+
+The `popKey` field is included in the `newOrder` request and echoed in the Order object. Its value is the Base64URL-encoded DER SubjectPublicKeyInfo of the key to be certified.
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+## ACME Challenge Object Fields Registry {#acme-challenge-object-fields-registry}
+
+IANA is requested to add the following entries to the "ACME Challenge Object Fields" registry (defined in {{!RFC8555}}, Section 9.7.4):
+
+| Field Name           | Field Type | Reference     |
+| -------------------- | ---------- | ------------- |
+| key                  | string     | this document |
+| popNonce             | string     | this document |
+| challenge_ciphertext | string     | this document |
+{: #tab-9 title="ACME Challenge Object Fields Registry Entries"}
+
+The `key` field is REQUIRED in all `pop-01` challenges. The `popNonce` field is REQUIRED in signature-key mode. The `challenge_ciphertext` field is REQUIRED in KEM-key mode.
+
+The entry is registered under the "Specification Required" policy established by {{!RFC8555}} for this registry. The Change Controller is the IETF.
+
+# Implementation Considerations {#implementation-considerations}
+
+## ACME Server (CA) {#acme-server-ca}
+
+### Obtaining and Storing `newOrder_hash` {#obtaining-and-storing-neworder-hash}
+
+As defined in Section 2, the server MUST retain the `raw_newOrder` payload octets, compute `newOrder_hash = SHA-256(raw_newOrder)`, and parse that same sequence as the request object; it MUST NOT hash a re-serialized JSON object (Section 5.1, step 1). The server stores `newOrder_hash` as data of the created order; challenge validation obtains the order through the stored `challenge -> authorization -> order` relationship.
+
+### Storing and Validating `popKey` {#storing-and-validating-popkey}
+
+The server-side requirements for receiving, validating, and storing `popKey` are specified in Section 3.2 and are not repeated here. In brief: the server verifies the request shape (Section 3.2, step 1), decodes and validates the DER SPKI against the Section 5 mapping and CA policy (steps 2-4), atomically stores `popKey` and `newOrder_hash` and creates exactly one `pop` authorization with one `pop-01` challenge (steps 6-10), and sets the challenge `key` to the accepted `popKey` string (step 11). For STAR orders, the retention and renewal-use requirements for the stored `popKey` are as specified in Section 3.2, step 6.
+
+Mode-specific proof material is handled as specified in Section 5: for signature keys, generate a fresh 32-byte `popNonce` and retain the decoded bytes only until the lifecycle rule in Section 5.4 applies; for KEM keys, check the ciphertext length after Encapsulate (Section 5.2), retain only `mac_key`, and compare proofs in constant time.
+
+### Public Key Comparison for Account Key Exclusion {#public-key-comparison-for-account-key-exclusion}
+
+When comparing a `popKey` value against the account public key, servers MUST use the canonical DER SPKI encoding of the account key as the comparison baseline. Implementations should be aware that:
+
+- The same RSA modulus and exponent may be represented with different DER encodings (e.g., leading zero bytes in the modulus); canonical DER encoding requires the minimal number of bytes per {{X.690}}.
+- The same EC point may be represented in compressed or uncompressed form; SPKI uses the uncompressed form (0x04 prefix) as specified in {{!RFC5480}}.
+- The same ML-KEM key has a single canonical encoding as specified in {{!RFC9935}}.
+
+Servers MUST reject any `popKey` that is cryptographically identical to the account key, regardless of encoding differences, by performing the byte-for-byte comparison after canonicalization.
+
+### Rate Limiting for KEM Encapsulation {#rate-limiting-for-kem-encapsulation}
+
+KEM encapsulation (ML-KEM.Encaps) is computationally more expensive than signature verification for classical keys. An attacker could repeatedly create orders containing KEM `popKey` values to consume server resources.
+
+Servers SHOULD apply rate limiting to `newOrder` requests containing a `popKey`, particularly for KEM key types where encapsulation is computationally expensive. Rate limits SHOULD be applied per account and per IP address to prevent resource exhaustion attacks. Servers MAY also reject `popKey` values for KEM algorithms that exceed the server's configured resource limits, returning `urn:ietf:params:acme:error:badPopKey`.
+
+### Error Returns {#error-returns}
+
+For a well-formed proof that fails cryptographic verification, the server returns HTTP 200 with an updated `invalid` challenge object containing a `badPoP` error. A request-layer syntax failure returns a top-level `malformed` problem response.
+
+## ACME Client {#acme-client}
+
+Before requesting CSR-less issuance, a client can check for `popSupported: true`. For a CSR-less request, the client:
+
+1. Serializes the "newOrder" JSON object once, retains the resulting octets as `raw_newOrder`, and uses those same octets as the JWS payload.
+2. Includes exactly one `{ "type": "pop", "value": "" }` identifier together with `popKey` and at least one certificate identifier.
+3. After receiving the initial order, verifies that the echoed `popKey` string is unchanged, that the order retains exactly one `pop` identifier, and that exactly one authorization URL resolves to an authorization with that identifier.
+4. Verifies that this authorization contains exactly one `pop-01` challenge.
+5. Verifies that the `key` field of the `pop-01` challenge is byte-identical to the `popKey` string submitted in the `newOrder` request.
+6. Constructs the proof and submits it in an account-key-authenticated challenge JWS.
+7. Retrieves the order URL using POST-as-GET until the order becomes `ready`, before sending the finalize request.
+
+### Fallback Behavior {#fallback-behavior}
+
+- **Pre-flight check:** Before creating an order, the client SHOULD check for `popSupported: true` in the directory metadata. If absent or false, the client MUST use the standard CSR flow.
+- **Hard failure fallback:** If the `newOrder` request is rejected with `unsupportedIdentifier`, the client MUST abandon the CSR-less attempt and create a new order using the CSR flow without the `pop` identifier.
+- **Inconsistent response fallback:** If the server returns an order that omits `popKey`, omits the `pop` identifier, or does not include exactly one `pop` authorization, the client MUST treat the CSR-less flow as rejected and fall back to CSR-based issuance.
+- **STAR capability fallback:** If the client intends to create a STAR order and the server does not advertise `popStarSupported: true`, the client MUST NOT include a `pop` identifier in that order, and SHOULD fall back to the CSR-based STAR flow.
+
+For example, a client that does not see `popSupported: true` uses the standard CSR-based flow with only certificate identifiers:
+
+~~~
+{
+  "identifiers": [
+    { "type": "dns", "value": "example.com" }
+  ]
+}
+~~~
+
+A server that receives an unsupported `pop` identifier rejects it with the existing `unsupportedIdentifier` error, as described in Section 3.2.
+
+## Implementation Status {#implementation-status}
+
+At the time of publication, the authors are not aware of any public implementations of this specification. The authors welcome implementation feedback.
+
+# Examples {#examples}
+
+## Signature Key with DNS Identifier {#signature-key-with-dns-identifier}
+
+The client controls `example.com` and has a P-256 certificate key. The server advertises `popSupported: true`.
+
+Step 1: Create the order.
+
+~~~
+{
+  "identifiers": [
+    {"type":"dns","value":"example.com"},
+    {"type":"pop","value":""}
+  ],
+  "popKey":"<base64url(spki_bytes)>"
+}
+~~~
+
+The HTTP entity is an account-key-authenticated JWS.
+
+Step 2: Retrieve the order and its two authorizations.
+
+~~~
+{
+  "status": "pending",
+  "expires": "2026-09-30T00:00:00Z",
+  "identifiers": [
+    { "type": "dns", "value": "example.com" },
+    { "type": "pop", "value": "" }
+  ],
+  "authorizations": [
+    "https://acme.example.com/acme/authz/dnsAuthz",
+    "https://acme.example.com/acme/authz/popAuthz"
+  ],
+  "popKey": "<base64url(spki_bytes)>",
+  "finalize": "https://acme.example.com/acme/order/xyz/finalize"
+}
+~~~
+
+The DNS authorization contains normal challenge alternatives. The `pop` authorization contains only `pop-01`:
+
+~~~
+{
+  "status": "pending",
+  "identifier": { "type": "pop", "value": "" },
+  "challenges": [{
+    "type": "pop-01",
+    "url": "https://acme.example.com/acme/chall/pop789",
+    "status": "pending",
+    "key": "<base64url(spki_bytes)>",
+    "popNonce": "<base64url(32 random bytes)>"
+  }]
+}
+~~~
+
+Step 3: Complete each authorization.
+
+The client completes one offered DNS challenge. For the `pop` authorization, it computes:
+
+~~~
+newOrder_hash = SHA-256(raw_newOrder)
+popNonce_bytes = base64url-decode(popNonce)
+to_sign = "ACME-pop-01-sig v1:" || popNonce_bytes || newOrder_hash
+proof = base64url(ECDSA-Sign-P1363(private_key, to_sign))
+~~~
+
+It submits the proof to `/acme/chall/pop789`.
+
+Step 4: Finalize without a CSR.
+
+~~~
+POST /acme/order/xyz/finalize HTTP/1.1
+Host: acme.example.com
+Content-Type: application/jose+json
+
+{
+  "protected": "<base64url(protected-header)>",
+  "payload": "e30",
+  "signature": "<base64url(account-key-signature)>"
+}
+~~~
+
+When the order becomes `valid`, the certificate URL is returned.
+
+## KEM Key with Device Attestation {#kem-key-with-device-attestation}
+
+An IoT device has an ML-KEM-768 certificate key and a permanent identifier `ABCDEF123456`, using the `permanent-identifier` identifier type defined in {{I-D.ietf-acme-device-attest}}. The order request is as follows:
+
+~~~
+{
+  "identifiers": [{
+    "type":"permanent-identifier",
+    "value":"ABCDEF123456"
+  }, {
+    "type":"pop",
+    "value":""
+  }],
+  "popKey":"<base64url(ml-kem-768-spki)>"
+}
+~~~
+
+The order contains separate device-attestation and `pop` authorizations. The `pop` authorization contains:
+
+~~~
+{
+  "status": "pending",
+  "identifier": { "type": "pop", "value": "" },
+  "challenges": [{
+    "type": "pop-01",
+    "url": "https://acme.example.com/acme/chall/pop890",
+    "status": "pending",
+    "key": "<base64url(ml-kem-768-spki)>",
+    "challenge_ciphertext": "<base64url(ml-kem-768-ciphertext)>"
+  }]
+}
+~~~
+
+The client computes the KEM proof:
+
+~~~
+ct = base64url-decode(challenge_ciphertext)
+shared_secret = ML-KEM-768.Decapsulate(private_key, ct)
+prk = HKDF-Extract[SHA-256](salt, IKM = shared_secret)
+mac_key = HKDF-Expand[SHA-256](prk,
+          info = ASCII("ACME-pop-01-KEM v1"), L = 32)
+newOrder_hash = SHA-256(raw_newOrder)
+proof = base64url(HMAC-SHA-256(mac_key, newOrder_hash))
+~~~
+
+*salt uses the default all-zero salt per {{!RFC5869}}, Section 2.2.*
+
+Once both the device-attestation and `pop` authorizations are valid, the order becomes `ready`. The client finalizes with an empty object.
+
+
+## Complete IoT Certificate Automation Stack (Informative) {#complete-iot-certificate-automation-stack-informative}
+
+This example shows how the CSR-less flow combines with device attestation and C509 for constrained IoT devices: `device-attest-01` establishes device identity and trusted state, `pop-01` proves possession of the certificate private key, and C509 delivers the certificate in compact CBOR. Device attestation details are defined in {{I-D.ietf-acme-device-attest}}; the C509 public key equivalence check is specified in Section 6.2. Client preferences such as `preferredCertificateFormat`, `c509Supported`, and `c509CertificateTypes` are illustrative and not defined as normative fields by this document.
+
+A constrained IoT device with an ML-KEM-768 key and a hardware trust anchor (e.g., TPM 2.0) requests a certificate for `sensor.example.com`. The flow follows Section 10.2 for the two authorizations, with C509 as the delivery format:
+
+1. The client sends `newOrder` with a `permanent-identifier` and a `pop` identifier plus a `popKey` carrying the ML-KEM-768 SPKI.
+2. The server creates a device-attestation authorization and a `pop` authorization.
+3. The client completes `device-attest-01` with hardware attestation evidence (the challenge mechanics are defined in {{I-D.ietf-acme-device-attest}}).
+4. The client completes the `pop-01` challenge as in Section 10.2.
+5. When both authorizations are `valid`, the order becomes `ready`; the client finalizes with an empty object.
+6. The server issues the certificate in C509 format, verifying that the CBOR-encoded subjectPublicKey is cryptographically equivalent to the validated `popKey` (Section 6.2). The certificate is returned with `Content-Type: application/cose-c509`.
+
+The two authorizations are independent and may be completed in any order; the order becomes `ready` only when both are `valid`, forming the trust statement "a trusted device holding this certificate key." If the device has no attestation support, the client omits `permanent-identifier` and uses a DNS identifier instead; if the server does not support C509, the certificate is returned in DER format. The `pop` authorization is the common proof-of-possession mechanism in both cases.
+
+When combined with STAR, the device requests a STAR order with a `popKey`/`pop` pair at bootstrap, and the CA automatically renews the C509 certificate from the validated `popKey` within the STAR order's lifetime without re-running the `pop-01` challenge (Section 3.5). This provides the CSR-less equivalent of {{!RFC8739}}'s auto-renewal for C509 deployments; the ACME account key is the sole in-protocol mechanism for stopping the renewal sequence (Section 7.5). Section 10.4 provides the complete STAR bootstrap flow for the CSR-less case.
+
+
+## STAR Bootstrap with CSR-less Flow (Informative) {#star-bootstrap-with-csr-less-flow-informative}
+
+This example illustrates how a client uses the `pop` authorization to bootstrap a STAR order {{!RFC8739}}, Section 2.1. The combination rules are specified in Section 3.5; this section focuses on the STAR-specific flow.
+
+**Step 0: Discover capability.**
+
+Before creating the order, the client checks that the server advertises `popSupported: true` (this document) and `auto-renewal` support in its directory metadata, as specified in Section 3.4.1.
+
+**Step 1: Client creates a STAR order.**
+
+The client includes an `auto-renewal` object in the `newOrder` request alongside the `popKey` and `pop` identifier.
+
+~~~
+{
+  "identifiers": [
+    { "type": "dns", "value": "example.com" },
+    { "type": "pop", "value": "" }
+  ],
+  "popKey": "<base64url(DER-encoded SPKI)>",
+  "auto-renewal": {
+    "end-date": "2027-08-30T00:00:00Z",
+    "lifetime": 86400
+  }
+}
+~~~
+
+The `auto-renewal` object syntax is defined in {{!RFC8739}}, Section 3.1.1; `end-date` and `lifetime` are required.
+
+**Step 2: Server processes the order.**
+
+The server processes the request as described in Section 3.2, creating both the identifier authorization (e.g., DNS) and the `pop` authorization. The server MAY adjust the auto-renewal values according to its local policy ({{!RFC8739}}, Section 3.1.1); the returned Order object includes the echoed `popKey` and the server-accepted `auto-renewal` object:
+
+~~~
+{
+  "status": "pending",
+  "expires": "2027-08-30T00:00:00Z",
+  "identifiers": [
+    { "type": "dns", "value": "example.com" },
+    { "type": "pop", "value": "" }
+  ],
+  "authorizations": [
+    "https://acme.example.com/acme/authz/dns-abc123",
+    "https://acme.example.com/acme/authz/pop-def456"
+  ],
+  "popKey": "<base64url(DER-encoded SPKI)>",
+  "auto-renewal": {
+    "end-date": "2027-08-30T00:00:00Z",
+    "lifetime": 86400
+  },
+  "finalize": "https://acme.example.com/acme/order/xyz/finalize"
+}
+~~~
+
+**Step 3: Complete the authorizations.**
+
+The client completes the identifier authorization (e.g., via `dns-01`) and the `pop-01` challenge as shown in Sections 10.1 and 10.2. Both authorizations MUST reach the `valid` state before the order becomes `ready`.
+
+**Step 4: Finalize the bootstrap.**
+
+Once the order is `ready`, the client sends an empty JSON object to the finalize endpoint, as specified in Section 6.1:
+
+~~~
+POST /acme/order/xyz/finalize HTTP/1.1
+Host: acme.example.com
+Content-Type: application/jose+json
+
+{
+  "protected": "<base64url(protected-header)>",
+  "payload": "e30",
+  "signature": "<base64url(account-key-signature)>"
+}
+~~~
+
+Once the order is `valid`, the client obtains the (rolling) STAR certificate from the `star-certificate` URL as defined in {{!RFC8739}}, Section 3.3. Automatic renewals are governed by the rules in Section 3.5; no new `pop-01` challenge is required.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- back
+
+{:appendix}
+# Design Decisions and Alternatives Considered {#appendix-a}
+
+This appendix documents the design decisions made in this document and the alternatives that were considered but not adopted. It is provided for informational purposes to help the Working Group understand the rationale behind the chosen design.
+
+## Comparison with CSR-based Issuance {#comparison-with-csr-based-issuance}
+
+The following table summarizes the key differences between the traditional CSR-based issuance flow and the `pop` authorization flow defined in this document:
+
+
+| Dimension                      | CSR-based Flow                      | `pop` Authorization Flow             |
+| ------------------------------ | ----------------------------------- | ------------------------------------ |
+| Public key submission          | In CSR at finalization              | In `newOrder` as `popKey`            |
+| Proof of possession            | CSR self-signature                  | `pop-01` challenge                   |
+| Binding time                   | Finalization                        | Authorization phase                  |
+| Substitution attack surface    | CSR can be replaced at finalization | None (key fixed at order creation)   |
+| Supported key types            | Signature-capable only              | All types (signature + KEM)          |
+| PKCS#10 CSR ASN.1/DER encoding | Required                            | Eliminated (popKey remains DER SPKI) |
+{: #tab-10 title="Comparison with CSR-based Issuance"}
+
+## Historical Context: Why CSR Was Chosen and Why It Is No Longer Necessary {#historical-context-why-csr-was-chosen-and-why-it-is-no-longer-necessary}
+
+ACME's original requirement for a PKCS#10 CSR at finalization was driven by three pragmatic considerations in 2015: concern about CA/Browser Forum Baseline Requirements mandating CSRs, compatibility with existing PKI toolchains and HSM workflows, and the convenience of using the CSR's self-signature as proof of possession.
+
+All three rationales have since eroded. The CA/Browser Forum Baseline Requirements do not mandate PKCS#10 CSRs for certificate issuance; they require validation of domain control and proof of possession, which other mechanisms can satisfy. ACME is now the Web PKI automation standard, so backward compatibility with legacy CSR workflows matters less. Post-quantum KEM keys cannot produce self-signatures, and the CSR-based PoP leaves a semantic window: the public key is not bound to the order until finalization, a property that matters in deployments with untrusted proxy components (see Section 7.1).
+
+The `pop` authorization design addresses this longstanding constraint by replacing the CSR-based PoP with an ACME-native mechanism aligned with the principle that the order is the authoritative source of client-declared certificate parameters.
+
+## The Two Paths for PoP and Why Order-Level PoP Was Rejected {#the-two-paths-for-pop-and-why-order-level-pop-was-rejected}
+
+During the development of this document, a key architectural question was whether proof-of-possession should be modeled as a new authorization type or as an order-level condition verified at finalization. In WG discussion, Ilari Liusvaara observed that two paths existed for implementing PoP in ACME:
+
+- **(a) New identifier type with dedicated authorization:** This approach reuses the existing ACME authorization state machine. The `pop` identifier requests a dedicated authorization whose sole challenge is `pop-01`. The order becomes `ready` only after all authorizations, including the `pop` authorization, are `valid`.
+- **(b) Public key as an order field:** This approach adds `popKey` and a PoP challenge URL directly to the order object. The PoP proof is submitted at finalization, alongside or instead of a CSR.
+
+The Working Group consensus favored path (a) for several reasons. It preserves the OR-semantics of existing identifier authorizations, avoids a new class of order-level wait condition, and leaves a clean integration path for future extensions. It also eliminates the late-binding semantic window that remains open in path (b) and in the traditional CSR flow, because the PoP proof must complete before the order becomes `ready`; that window matters in deployments with untrusted proxy components (see Section 7.1).
+
+Two order-level variants of path (b) were discussed and rejected:
+
+- **Order-level field without authorization:** adding a `popState` field to the order object to track PoP status. This would bypass the standard ACME authorization state machine, require special-case logic in order processing, and force clients to handle PoP differently from other verifications, increasing implementation complexity.
+- **Order-level PoP verified at finalization:** adding a `keyPopNonce` field to the order and requiring the client to submit the PoP proof at finalization. When the order transitions to `ready`, the server has not yet verified that the client possesses the private key corresponding to the declared public key; `ready` therefore loses its semantic meaning that all verifications required for issuance have been completed. The temporal separation creates a window in which the binding between the declared public key and the proof of possession could be subverted. While the protocol could be specified to prevent direct replacement of the public key at finalization, this does not eliminate the underlying architectural weakness.
+
+The `pop` authorization design avoids both issues: all verifications, including proof-of-possession, are completed before the order becomes `ready`, preserving the semantic meaning of the `ready` state. The client experience remains uniform, as all verifications are represented as authorizations.
+
+## Why a Dedicated Authorization, Not a Challenge Attached to Certificate-Identifier Authorizations? {#why-a-dedicated-authorization-not-a-challenge-attached-to-certificate-identifier-authorizations}
+
+The design of attaching a PoP challenge to each identifier authorization was considered and rejected for the following reasons:
+
+- **OR-semantics violation:** ACME authorizations have OR-semantics (any one challenge succeeds -> authorization valid). A PoP challenge attached to an identifier authorization would require AND-semantics (identifier challenge AND PoP challenge) to achieve the desired security property. This would fundamentally change the semantics of existing authorization processing.
+- **Multi-identifier inefficiency:** An order with N identifiers would require N separate PoP challenges, each proving the same private key possession. This is inefficient and scales poorly.
+- **Semantic confusion:** Mixing identifier control validation and private key possession proof in the same authorization conflates two logically independent concerns.
+
+## Why the `pop` Identifier Value Is the Empty String {#why-the-pop-identifier-value-is-the-empty-string}
+
+The `pop` identifier's value is the empty string to explicitly indicate that it is not a certificate identifier. This avoids any confusion with DNS names, email addresses, or other identifiers that could appear in the issued certificate. An empty value is also consistent with the precedent set by {{I-D.ietf-acme-rats}} for auxiliary identifiers that do not represent a certificate identity.
+
+## `popKey` Encoding and Future Evolution {#popkey-encoding-and-future-evolution}
+
+The `popKey` field is defined as a DER-encoded SubjectPublicKeyInfo (SPKI) {{!RFC5280}}, while the document's secondary motivation is to reduce encoding complexity for constrained clients. This tension is deliberate: a pragmatic tradeoff between cryptographic consistency and ecosystem compatibility.
+
+**Current Design Choice: DER SPKI**
+
+The decision to use DER SPKI for `popKey` is based on the following considerations:
+
+1. **Certificate Format Compatibility:** The X.509 certificates issued by the ACME server contain the public key in DER SPKI format. Accepting the public key in the same format from the client allows the server to use it directly for certificate issuance, avoiding error-prone format conversions that could introduce security vulnerabilities.
+2. **Ecosystem Compatibility:** The DER SPKI format is the standard public key representation for interactions with HSMs, PKCS#11 tokens, and existing CA software. Requiring clients to submit public keys in this format maximizes interoperability with existing PKI infrastructure.
+3. **Scope of "ASN.1-Free":** The "ASN.1-free" claim in this document is scoped to the certificate request process: the client no longer needs to construct a full PKCS#10 CSR with its associated ASN.1 structures and signing logic. The SPKI encoding of the public key remains necessary for compatibility with the X.509 certificate format and existing PKI toolchains. This distinction is reflected in the revised Abstract and Section 1.1.
+4. **C509 Interoperability:** For C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}}, the server MUST verify cryptographic equivalence between the DER-encoded `popKey` and the CBOR-encoded key in the issued certificate, rather than requiring byte-for-byte identity (see Section 6.2). This ensures compatibility with constrained environments while maintaining a single public key declaration format.
+
+**Future Evolution: Alternative Public Key Encodings**
+
+The current design is not intended to be the final word on public key encodings for CSR-less ACME. As the ecosystem evolves and deployment experience with non-DER formats matures, future revisions or extensions could consider alternative encodings:
+
+1. **JWK Support:** Accepting JSON Web Key (JWK) format for `popKey` would align with the JOSE ecosystem used elsewhere in ACME {{!RFC7515}} and eliminate ASN.1/DER processing for clients that already handle JWK. The server would need to convert JWK to DER SPKI before certificate issuance. This would particularly benefit clients in JavaScript environments or those already integrating with OAuth/OpenID Connect workflows.
+2. **C509 Native CBOR Encoding:** For deployments exclusively using C509 certificates {{I-D.ietf-cose-cbor-encoded-cert}}, accepting the C509 CBOR encoding of the public key directly would enable a fully CBOR-native issuance path. This would require the server to understand C509's optimized public key representations (e.g., compressed EC points, CBOR-encoded RSA parameters). Such an extension would eliminate the final remaining ASN.1/DER dependency for C509-only deployments, creating a truly end-to-end CBOR-based certificate issuance flow.
+
+These alternatives are not adopted in this document due to the additional server-side complexity, the need for widespread implementation experience, and the current lack of deployment data. The Working Group may consider them in future extensions once the ecosystem has matured and deployment experience with C509 and other non-DER formats has been gained. Any such extension must define unambiguous conversion rules between the alternative encoding and the DER SPKI format required for X.509 certificate issuance.
+
+
+{:appendix}
+# Document Revision History (Informative) {#document-revision-history-informative}
+
+**draft-geng-acme-public-key-00:** Initial publication. Introduced the concept of a public key challenge as an alternative to CSR-based finalization.  Proposed multiple challenge variants bound to different identifier types.
+
+**draft-geng-acme-public-key-01:** Minor editorial refinements. Clarified scope and relationship with existing ACME challenge types.
+
+**draft-geng-acme-public-key-02:** Refined challenge attachment model. Addressed early feedback on identifier binding semantics.
+
+**draft-geng-acme-public-key-03:** Structural reorganization of challenge object fields. Improved alignment with RFC8555 terminology.
+
+**draft-geng-acme-public-key-04:** Expanded challenge variants to six distinct types covering both PoP and identifier control validation. Introduced the pk_binding object in newOrder request.  First draft to reference public key identity authentication protocols.  Last combined version before functional split per IETF 125 feedback.
+
+**draft-geng-acme-public-key-05:** Functional split: "pk-01" now focuses exclusively on proof-of-possession.  Identifier control validation moved to draft-geng-acme-idp-01.  Challenge consolidation into single pk-01 challenge.  Introduced pop_mode negotiation and ALPN identifier acme-pk/1.
+
+**draft-geng-acme-public-key-06:** Refined pop_mode semantics. Added comprehensive security considerations. Introduced initial KEM key support framework. WG adoption call issued (April 2026) did not pass due to architectural concerns regarding challenge semantics and insufficient community support.
+
+**draft-geng-acme-public-key-07:** Removed `pop_mode`. "pk-01" became exclusively a proof-of-possession challenge.  Added `popKeyAccepted` and `popSupported` fields.  Established IANA "ACME PoP Key Algorithms" registry.  Added KEM revocation guidance.
+
+
+**draft-geng-acme-pop-00:** Complete architectural redesign: PoP becomes a dedicated `pop` authorization (one `pop-01` challenge per order). `pop` authorizations are order-bound and non-reusable. Added composition rules for STAR, C509, profiles, device attestation, RATS, and composite KEM keys. Expanded security analysis for KEM+STAR and KEM non-repudiation.
+
+**draft-geng-acme-pop-01:** Editorial and normative refinements in preparation for WGLC. Corrected the IANA registrations and replaced `unsupportedIdentifier` with `malformed` where the server supports the identifier type but not the specific context. Added the `popStarSupported` directory field and clarified STAR discovery, added ML-DSA/SLH-DSA context-string guidance, and expanded client fallback behavior. Fixed reference hygiene and other minor editorial corrections.
+
+# Acknowledgments {#acknowledgments}
+{:numbered="false"}
+
+This document has benefited from discussion, review, and constructive feedback throughout its development, beginning with the initial discussion of the public-key challenge on the ACME mailing list. The authors thank Mike Ounsworth for challenging the original threat model and encouraging the authors to focus the document on its core use cases; Aaron Gable for highlighting the value of a public-key identifier for CSR-less finalization and KEM keys, and for encouraging a focused treatment of the public-key identifier and challenge; and Ilari Liusvaara for early protocol feedback and analysis of alternative designs.
+
+The authors also thank John Gray, Ilari Liusvaara, David Benjamin, Aaron Gable, and Richard Barnes for discussion and revision suggestions at IETF 125. The authors thank Tim Hollebeek for feedback on the KEM proof construction, and Michael Richardson for detailed comments during the Working Group adoption discussion, including comments that helped clarify the separation of proof-of-possession from identifier validation. Mike Ounsworth's subsequent review and guidance also helped focus the work on a standalone proof-of-possession mechanism.
+
+The authors further thank Greg T. Wallace and Seo Suchan for feedback on the later authorization-based design, and the ACME Working Group chairs and participants for their constructive discussion and review.
